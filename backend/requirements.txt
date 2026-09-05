@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+python-multipart
+pydantic
+pydantic-settings
+pandas
+polars
+openpyxl
+sqlalchemy
+asyncpg
+alembic
+boto3
+greenlet
