@@ -15,6 +15,16 @@ psycopg[binary]
 alembic
 greenlet
 
-boto3
-
 liboqs-python
+cmake
+ninja
+
+langgraph
+litellm
+presidio-analyzer
+presidio-anonymizer
+
+redis
+httpx
+pytest
+pytest-asyncio

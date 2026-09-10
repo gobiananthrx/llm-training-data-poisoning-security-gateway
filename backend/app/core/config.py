@@ -5,16 +5,23 @@ class Settings(BaseSettings):
     app_name: str = "Dataset Security Gateway"
     environment: str = "development"
 
-    database_url: str
+    database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/dataset_security"
+    redis_url: str = "redis://localhost:6379/0"
+    opa_url: str = "http://localhost:8181/v1/data/dataset_policy"
 
-    # Object storage is S3-compatible in deployment.
-    # MinIO can be used locally without changing the application contract.
+    # LLM settings
+    gemini_api_key: str | None = None
+    groq_api_key: str | None = None
+    gemini_model: str = "gemini/gemini-2.5-flash"
+    groq_model: str = "groq/llama-3.3-70b-versatile"
+
+    # Storage
     object_storage_endpoint: str | None = None
     object_storage_bucket: str = "datasets"
     object_storage_region: str = "ap-south-1"
 
-    # Comma-separated browser origins.
-    cors_origins: str = "http://localhost:3000"
+    # Browser origins
+    cors_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
 
     model_config = SettingsConfigDict(
         env_file=".env",
