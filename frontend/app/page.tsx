@@ -60,11 +60,19 @@ const ALL_AGENTS = ["semantic", "behavioral", "inconsistency", "pii"];
 type HITLFilterType = "ALL" | "QUARANTINED" | "REJECTED" | "APPROVED";
 
 function getDatasetHITLState(d: DatasetItem): "QUARANTINED" | "REJECTED" | "APPROVED" | null {
-  const dec = (d.opa_decision || "").toUpperCase();
   const stat = (d.status || "").toUpperCase();
-  if (dec === "QUARANTINE" || stat === "QUARANTINED") return "QUARANTINED";
-  if (dec === "REJECT" || stat === "REJECTED") return "REJECTED";
-  if (dec === "APPROVE" || stat === "APPROVED") return "APPROVED";
+  const dec = (d.opa_decision || "").toUpperCase();
+
+  // If a human review has explicitly updated the status, that status takes precedence
+  if (stat === "APPROVED") return "APPROVED";
+  if (stat === "REJECTED") return "REJECTED";
+  if (stat === "QUARANTINED") return "QUARANTINED";
+
+  // Otherwise, fall back to OPA policy decision
+  if (dec === "APPROVE") return "APPROVED";
+  if (dec === "REJECT") return "REJECTED";
+  if (dec === "QUARANTINE") return "QUARANTINED";
+
   return null;
 }
 
@@ -878,7 +886,8 @@ export default function PipelineAndHITLPage() {
             {filteredDatasets.map((ds) => {
               const isExpanded = !!expandedDatasets[ds.dataset_id];
               const dsState = getDatasetHITLState(ds);
-              const isQuarantined = dsState === "QUARANTINED";
+              const isApproved = dsState === "APPROVED" || (ds.status || "").toUpperCase() === "APPROVED";
+              const isQuarantined = dsState === "QUARANTINED" && !isApproved;
               const activeAgents = agentFilters[ds.dataset_id] || [...ALL_AGENTS];
               const cacheKey = `${ds.dataset_id}_v${ds.version}`;
               const content = contentCache[cacheKey];
@@ -1189,7 +1198,7 @@ export default function PipelineAndHITLPage() {
                         </div>
 
                         {/* Staged Modifications & Rerun Button (primarily for quarantined) */}
-                        {(dsModCount > 0 || dsRemCount > 0) && (
+                        {!isApproved && (dsModCount > 0 || dsRemCount > 0) && (
                           <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
                             <span style={{ fontSize: "12px", color: "#b45309", fontWeight: 500 }}>
                               Staged: {dsModCount} edit(s), {dsRemCount} removal(s)
@@ -1241,7 +1250,9 @@ export default function PipelineAndHITLPage() {
                                     {content.columns.map((col: string) => (
                                       <th key={col} style={{ padding: "10px 14px", color: "#374151", fontWeight: 600 }}>{col}</th>
                                     ))}
-                                    <th style={{ padding: "10px 14px", width: "80px", textAlign: "right" }}>Actions</th>
+                                    {!isApproved && (
+                                      <th style={{ padding: "10px 14px", width: "80px", textAlign: "right" }}>Actions</th>
+                                    )}
                                   </tr>
                                 </thead>
                                 <tbody>
@@ -1317,49 +1328,53 @@ export default function PipelineAndHITLPage() {
                                                     </span>
                                                   )}
                                                 </span>
-                                                <button
-                                                  onClick={(e) => {
-                                                    e.stopPropagation();
-                                                    setEditModalInfo({
-                                                      datasetId: ds.dataset_id,
-                                                      version: ds.version,
-                                                      recordId: rId,
-                                                      field: col,
-                                                      value: displayVal,
-                                                    });
-                                                  }}
-                                                  style={{
-                                                    border: "1px solid #d1d5db",
-                                                    background: "#ffffff",
-                                                    color: "#4b5563",
-                                                    padding: "2px 6px",
-                                                    borderRadius: "4px",
-                                                    fontSize: "11px",
-                                                    cursor: "pointer",
-                                                  }}
-                                                >
-                                                  Edit
-                                                </button>
+                                                {!isApproved && (
+                                                  <button
+                                                    onClick={(e) => {
+                                                      e.stopPropagation();
+                                                      setEditModalInfo({
+                                                        datasetId: ds.dataset_id,
+                                                        version: ds.version,
+                                                        recordId: rId,
+                                                        field: col,
+                                                        value: displayVal,
+                                                      });
+                                                    }}
+                                                    style={{
+                                                      border: "1px solid #d1d5db",
+                                                      background: "#ffffff",
+                                                      color: "#4b5563",
+                                                      padding: "2px 6px",
+                                                      borderRadius: "4px",
+                                                      fontSize: "11px",
+                                                      cursor: "pointer",
+                                                    }}
+                                                  >
+                                                    Edit
+                                                  </button>
+                                                )}
                                               </div>
                                             </td>
                                           );
                                         })}
 
-                                        <td style={{ padding: "10px 14px", textAlign: "right" }}>
-                                          <button
-                                            onClick={() => toggleRowRemoval(ds.dataset_id, rId)}
-                                            style={{
-                                              border: isRowRemoved ? "1px solid #111827" : "1px solid #ef4444",
-                                              background: isRowRemoved ? "#111827" : "#ffffff",
-                                              color: isRowRemoved ? "#ffffff" : "#dc2626",
-                                              padding: "3px 8px",
-                                              borderRadius: "4px",
-                                              fontSize: "11px",
-                                            }}
-                                          >
-                                            {isRowRemoved ? "Undo" : "Remove"}
-                                          </button>
-                                        </td>
+                                        {!isApproved && (
+                                          <td style={{ padding: "10px 14px", textAlign: "right" }}>
+                                            <button
+                                              onClick={() => toggleRowRemoval(ds.dataset_id, rId)}
+                                              style={{
+                                                border: isRowRemoved ? "1px solid #111827" : "1px solid #ef4444",
+                                                background: isRowRemoved ? "#111827" : "#ffffff",
+                                                color: isRowRemoved ? "#ffffff" : "#dc2626",
+                                                padding: "3px 8px",
+                                                borderRadius: "4px",
+                                                fontSize: "11px",
+                                              }}
+                                            >
+                                              {isRowRemoved ? "Undo" : "Remove"}
+                                            </button>
+                                          </td>
+                                        )}
                                       </tr>
                                     );
                                   })}

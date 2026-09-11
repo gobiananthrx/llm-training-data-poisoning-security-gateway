@@ -75,12 +75,9 @@ export default function DataCollectionPage() {
     <div style={{ maxWidth: 880, margin: "40px auto", padding: "0 24px" }}>
       {/* Header */}
       <div style={{ marginBottom: 28, paddingBottom: 16, borderBottom: "1px solid #e5e7eb" }}>
-        <h2 style={{ fontSize: 20, fontWeight: 600, color: "#111827", marginBottom: 4 }}>
+        <h2 style={{ fontSize: 20, fontWeight: 600, color: "#111827" }}>
           Data Collection & Provenance Ingestion
         </h2>
-        <p style={{ fontSize: 13, color: "#6b7280" }}>
-          Upload raw datasets (CSV, JSON, TXT, XLSX). Single file at once. Content is canonicalized, hashed with SHA-256, and signed using Post-Quantum ML-DSA-65 before persistence.
-        </p>
       </div>
 
       {/* Upload Box */}
@@ -130,15 +127,11 @@ export default function DataCollectionPage() {
           >
             Select Dataset File (.csv, .json, .txt, .xlsx)
           </label>
-          <div style={{ fontSize: 12, color: "#6b7280", marginTop: 4 }}>
-            {file ? (
-              <span style={{ color: "#111827", fontWeight: 500 }}>
-                Selected: {file.name} ({(file.size / 1024).toFixed(1)} KB)
-              </span>
-            ) : (
-              "Supports one file per upload: customer_support.csv, knowledge.json, operations.xlsx"
-            )}
-          </div>
+          {file && (
+            <div style={{ fontSize: 12, color: "#111827", fontWeight: 500, marginTop: 4 }}>
+              Selected: {file.name} ({(file.size / 1024).toFixed(1)} KB)
+            </div>
+          )}
         </div>
 
         <div style={{ display: "flex", justifyContent: "flex-end" }}>
