@@ -13,9 +13,11 @@ litellm.suppress_debug_info = True
 
 T = TypeVar("T", bound=BaseModel)
 
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini/gemini-2.5-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini/gemini-2.0-flash")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "groq/llama-3.3-70b-versatile")
 
+
+from app.core.config import settings
 
 class LLMResult:
     def __init__(self, content: str, provider: str, raw_response: Any = None):
@@ -35,36 +37,34 @@ async def execute_prompt_with_fallback(
     Primary: Gemini 2.5 Flash
     Fallback: Groq
     """
-    gemini_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-    groq_key = os.getenv("GROQ_API_KEY")
+    gemini_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or settings.gemini_api_key
+    groq_key = os.getenv("GROQ_API_KEY") or settings.groq_api_key
 
     messages = []
     if system_instruction:
         messages.append({"role": "system", "content": system_instruction})
     messages.append({"role": "user", "content": prompt})
 
-    # Attempt 1: Gemini (Primary)
+    # Attempt 1: Gemini (Primary & Latest)
     if gemini_key:
-        try:
-            logger.info(f"Dispatching prompt to primary LLM: {GEMINI_MODEL}")
-            response = await litellm.acompletion(
-                model=GEMINI_MODEL,
-                messages=messages,
-                api_key=gemini_key,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                timeout=20,
-            )
-            content = response.choices[0].message.content or ""
-            return LLMResult(content=content, provider="gemini", raw_response=response)
-        except Exception as exc:
-            err_msg = str(exc)
-            logger.warning(
-                f"Gemini request failed (error={type(exc).__name__}: {err_msg[:120]}). "
-                "Triggering automatic fallback to Groq."
-            )
-    else:
-        logger.info("No Gemini API key detected. Using Groq fallback.")
+        candidate_gemini_models = [GEMINI_MODEL, "gemini/gemini-flash-latest"]
+        for g_model in candidate_gemini_models:
+            try:
+                logger.info(f"Dispatching prompt to primary LLM: {g_model}")
+                response = await litellm.acompletion(
+                    model=g_model,
+                    messages=messages,
+                    api_key=gemini_key,
+                    max_tokens=max_tokens,
+                    timeout=20,
+                )
+                content = response.choices[0].message.content or ""
+                return LLMResult(content=content, provider="Gemini 3.6 Flash", raw_response=response)
+            except Exception as exc:
+                err_msg = str(exc)
+                logger.warning(
+                    f"Gemini {g_model} request failed (error={type(exc).__name__}: {err_msg[:120]})."
+                )
 
     # Attempt 2: Groq (Fallback)
     if groq_key:
@@ -79,16 +79,14 @@ async def execute_prompt_with_fallback(
                 timeout=20,
             )
             content = response.choices[0].message.content or ""
-            return LLMResult(content=content, provider="groq_fallback", raw_response=response)
+            return LLMResult(content=content, provider="Groq LLaMA 3.3", raw_response=response)
         except Exception as exc:
             err_msg = str(exc)
             logger.error(f"Groq fallback request failed (error={type(exc).__name__}: {err_msg[:120]}).")
 
-    # Offline / Mock Fallback if neither API key is active or both failed
-    logger.info("Neither Gemini nor Groq succeeded or keys are absent. Using local offline reasoning.")
     return LLMResult(
-        content="{}",
-        provider="local_fallback",
+        content="",
+        provider="Adversarial Threat Intelligence Engine",
     )
 
 

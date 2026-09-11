@@ -9,6 +9,9 @@ from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+import hashlib
+from fastapi.responses import FileResponse
+
 from app.db.database import get_db
 from app.db.models import (
     AgentFinding,
@@ -30,6 +33,7 @@ from app.services.cryptography import (
     create_provenance,
     get_public_key,
     sign_provenance,
+    verify_signature,
 )
 from app.services.dataset_processor import normalize_dataset, validate_and_process
 from app.services.hashing import calculate_sha256
@@ -179,6 +183,7 @@ async def upload_dataset(
 
 
 @router.get("", response_model=list[DatasetItemResponse])
+@router.get("/", response_model=list[DatasetItemResponse])
 async def list_datasets(db: AsyncSession = Depends(get_db)):
     """
     Returns list of all datasets with active version, risk scores, and decisions.
@@ -627,3 +632,268 @@ async def get_audit_trail(
         }
         for e in events
     ]
+
+
+@router.post("/pipeline-upload")
+async def pipeline_upload_and_verify(
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Pipeline upload entry point:
+    1. Preprocesses file, calculates hash and ML-DSA signature comparison with existing DB metadata.
+    2. If no dataset found in DB or signature mismatch -> Block the dataset.
+    3. If same name and type but different size or metadata -> store as version = current + 1.
+    4. Executes multi-agent security pipeline.
+    """
+    filename = file.filename or ""
+    extension = Path(filename).suffix.lower()
+
+    if extension not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unsupported file type: {extension or 'unknown'}. Allowed: .csv, .json, .txt, .xlsx",
+        )
+
+    file_type = extension.lstrip(".")
+    content_bytes = await file.read()
+    file_size = len(content_bytes)
+    sha256 = hashlib.sha256(content_bytes).hexdigest()
+
+    # Query DB for existing dataset with this filename
+    stmt = (
+        select(Dataset)
+        .where(Dataset.filename == filename)
+        .order_by(desc(Dataset.created_at))
+        .options(
+            selectinload(Dataset.versions).selectinload(DatasetVersion.risk_assessments),
+            selectinload(Dataset.versions).selectinload(DatasetVersion.policy_decisions),
+        )
+    )
+    result = await db.execute(stmt)
+    existing_dataset = result.scalars().first()
+
+    if not existing_dataset or not existing_dataset.versions:
+        # Case 1: Unregistered dataset in Data Collection -> BLOCK
+        dataset_id = f"DS-{uuid4().hex[:12].upper()}"
+        version = 1
+
+        dest_dir = Path("data/uploads") / dataset_id / f"v{version}"
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        stored_path = dest_dir / filename
+        with open(stored_path, "wb") as f:
+            f.write(content_bytes)
+
+        processing_summary = validate_and_process(stored_path, extension)
+
+        ds = Dataset(
+            dataset_id=dataset_id,
+            filename=filename,
+            source="pipeline_direct_upload",
+            description="Direct upload to pipeline without prior data collection ingestion",
+        )
+        dv = DatasetVersion(
+            version=version,
+            file_type=file_type,
+            file_size=file_size,
+            sha256=sha256,
+            signature_algorithm="ML-DSA-65",
+            signature="",
+            public_key="",
+            provenance=None,
+            status="BLOCKED",
+            storage_location=str(stored_path),
+            record_count=processing_summary.get("record_count") or processing_summary.get("rows"),
+        )
+        policy_dec = PolicyDecision(
+            decision="REJECT",
+            reasons=["Blocked: Dataset not registered in Data Collection registry. Pre-training provenance attestation missing."],
+            policy_input={"cryptographic_verified": False, "filename": filename},
+            policy_output={"decision": "REJECT"},
+        )
+        audit = AuditEvent(
+            event_type="cryptographic_verification_failed",
+            dataset_id=dataset_id,
+            version=version,
+            details={"reason": "Unregistered dataset in data collection repository. Blocked by security gateway."},
+        )
+        ds.versions.append(dv)
+        dv.policy_decisions.append(policy_dec)
+        db.add(ds)
+        db.add(audit)
+        await db.commit()
+
+        await emit_pipeline_event("verification_failed", dataset_id, version, {
+            "reason": "Dataset not registered in Data Collection registry. Pre-training provenance attestation missing."
+        })
+
+        return {
+            "dataset_id": dataset_id,
+            "version": version,
+            "filename": filename,
+            "file_size": file_size,
+            "status": "BLOCKED",
+            "blocked": True,
+            "decision": "REJECT",
+            "risk_score": 100,
+            "risk_level": "CRITICAL",
+            "findings_count": 0,
+            "reason": "Dataset not registered in Data Collection registry. Pre-training provenance attestation missing.",
+            "sha256": sha256,
+        }
+
+    # Case 2: Dataset exists in DB. Check latest version.
+    latest_ver = max(existing_dataset.versions, key=lambda v: v.version)
+
+    if file_size != latest_ver.file_size or sha256 != latest_ver.sha256:
+        # Case 2A: Same name and type, but different size/metadata -> store as version = current + 1
+        new_version = latest_ver.version + 1
+        dest_dir = Path("data/uploads") / existing_dataset.dataset_id / f"v{new_version}"
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        stored_path = dest_dir / filename
+        with open(stored_path, "wb") as f:
+            f.write(content_bytes)
+
+        processing_summary = validate_and_process(stored_path, extension)
+
+        provenance = create_provenance(
+            dataset_id=existing_dataset.dataset_id,
+            version=new_version,
+            filename=filename,
+            file_type=file_type,
+            file_size=file_size,
+            sha256=sha256,
+            source="pipeline_version_update",
+        )
+        signature = sign_provenance(provenance)
+        public_key = get_public_key()
+
+        new_dv = DatasetVersion(
+            version=new_version,
+            file_type=file_type,
+            file_size=file_size,
+            sha256=sha256,
+            signature_algorithm="ML-DSA-65",
+            signature=signature,
+            public_key=public_key,
+            provenance=provenance,
+            status="VERIFIED",
+            storage_location=str(stored_path),
+            record_count=processing_summary.get("record_count") or processing_summary.get("rows"),
+        )
+        audit_ver = AuditEvent(
+            event_type="new_version_created",
+            dataset_id=existing_dataset.dataset_id,
+            version=new_version,
+            details={"filename": filename, "version": new_version, "reason": "Uploaded dataset metadata difference detected."},
+        )
+        audit_pass = AuditEvent(
+            event_type="cryptographic_verification_passed",
+            dataset_id=existing_dataset.dataset_id,
+            version=new_version,
+            details={"sha256": sha256, "signature_algorithm": "ML-DSA-65"},
+        )
+        existing_dataset.versions.append(new_dv)
+        db.add(audit_ver)
+        db.add(audit_pass)
+        await db.commit()
+
+        target_dataset_id = existing_dataset.dataset_id
+        target_version = new_version
+    else:
+        # Case 2B: Same metadata -> compare signature with registered DB provenance
+        target_dataset_id = existing_dataset.dataset_id
+        target_version = latest_ver.version
+
+        sig_valid = False
+        if latest_ver.signature and latest_ver.public_key and latest_ver.provenance:
+            try:
+                sig_valid = verify_signature(latest_ver.provenance, latest_ver.signature, latest_ver.public_key)
+            except Exception:
+                sig_valid = False
+
+        if not sig_valid:
+            latest_ver.status = "BLOCKED"
+            audit_fail = AuditEvent(
+                event_type="cryptographic_verification_failed",
+                dataset_id=target_dataset_id,
+                version=target_version,
+                details={"reason": "Signature verification failed against registered provenance."},
+            )
+            db.add(audit_fail)
+            await db.commit()
+
+            await emit_pipeline_event("verification_failed", target_dataset_id, target_version, {
+                "reason": "Cryptographic signature mismatch. Dataset has been tampered or signature invalid."
+            })
+
+            return {
+                "dataset_id": target_dataset_id,
+                "version": target_version,
+                "filename": filename,
+                "file_size": file_size,
+                "status": "BLOCKED",
+                "blocked": True,
+                "decision": "REJECT",
+                "risk_score": 100,
+                "risk_level": "CRITICAL",
+                "findings_count": 0,
+                "reason": "Cryptographic signature mismatch. Dataset has been tampered or signature invalid.",
+                "sha256": sha256,
+            }
+
+        latest_ver.status = "VERIFIED"
+        await db.commit()
+
+    # Multi-agent pipeline analysis
+    pipeline_res = await execute_security_pipeline(
+        dataset_id=target_dataset_id,
+        version=target_version,
+        db=db,
+    )
+
+    return {
+        "dataset_id": target_dataset_id,
+        "version": target_version,
+        "filename": filename,
+        "file_size": file_size,
+        "status": "VERIFIED",
+        "blocked": False,
+        "decision": pipeline_res.get("decision", "APPROVE"),
+        "risk_score": pipeline_res.get("risk_score", 0),
+        "risk_level": pipeline_res.get("risk_level", "LOW"),
+        "findings_count": pipeline_res.get("findings_count", 0),
+        "sha256": sha256,
+    }
+
+
+@router.get("/{dataset_id}/versions/{version}/download")
+async def download_dataset(
+    dataset_id: str,
+    version: int,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Downloads authorized dataset file for model training.
+    """
+    stmt = (
+        select(DatasetVersion, Dataset)
+        .join(Dataset, Dataset.id == DatasetVersion.dataset_id)
+        .where(Dataset.dataset_id == dataset_id, DatasetVersion.version == version)
+    )
+    result = await db.execute(stmt)
+    row = result.first()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Dataset version not found")
+
+    ver, dataset = row
+    if not ver.storage_location or not Path(ver.storage_location).exists():
+        raise HTTPException(status_code=404, detail="Dataset file not found on disk")
+
+    clean_filename = f"{dataset.filename or 'dataset'}"
+    return FileResponse(
+        path=ver.storage_location,
+        filename=clean_filename,
+        media_type="application/octet-stream",
+    )

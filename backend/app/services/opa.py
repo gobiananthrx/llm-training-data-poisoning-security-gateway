@@ -58,9 +58,12 @@ async def evaluate_policy(
     if not cryptographic_verified:
         decision = "REJECT"
         reasons = ["Cryptographic integrity check failed. Signature or SHA-256 mismatch."]
-    elif risk_score >= 50 or high_severity_findings > 0 or human_review_required:
+    elif risk_score >= 65:
+        decision = "REJECT"
+        reasons = [f"High risk score ({risk_score}/100) exceeds safety threshold. Dataset rejected from model training."]
+    elif risk_score >= 20 or human_review_required:
         decision = "QUARANTINE"
-        reasons = [f"Quarantined due to risk score {risk_score} or {high_severity_findings} high-severity findings."]
+        reasons = [f"Moderate risk score ({risk_score}/100) requires isolation in quarantine for human remediation."]
     else:
         decision = "APPROVE"
         reasons = ["Dataset meets cryptographic and security policy criteria for model training."]

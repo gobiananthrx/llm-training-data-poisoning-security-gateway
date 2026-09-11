@@ -185,7 +185,7 @@ export default function DataCollectionPage() {
             borderRadius: 6,
           }}>
             <div style={{ display: "flex", alignItems: "center", gap: 8, color: "#15803d", fontWeight: 600, fontSize: 14, marginBottom: 12 }}>
-              <span>✓</span> Dataset Ingested & Cryptographically Signed
+              <span>[OK]</span> Dataset Ingested & Cryptographically Signed
             </div>
             <div style={{ display: "grid", gridTemplateColumns: "140px 1fr", gap: "8px 12px", fontSize: 12 }}>
               <div style={{ color: "#4b5563" }}>Dataset ID:</div>

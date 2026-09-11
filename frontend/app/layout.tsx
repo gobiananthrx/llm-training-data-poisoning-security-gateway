@@ -23,7 +23,7 @@ export default function RootLayout({
           }
           body {
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-            background-color: #fcfcfc;
+            background-color: #fbfbfb;
             color: #111827;
             line-height: 1.5;
             -webkit-font-smoothing: antialiased;
@@ -39,49 +39,112 @@ export default function RootLayout({
           input, select, textarea {
             font-family: inherit;
           }
+          @keyframes progress-stripe {
+            0% { background-position: 0 0; }
+            100% { background-position: 30px 0; }
+          }
+          .running-progress {
+            background-image: linear-gradient(
+              -45deg,
+              rgba(255, 255, 255, 0.25) 25%,
+              transparent 25%,
+              transparent 50%,
+              rgba(255, 255, 255, 0.25) 50%,
+              rgba(255, 255, 255, 0.25) 75%,
+              transparent 75%,
+              transparent
+            );
+            background-size: 30px 30px;
+            animation: progress-stripe 1.2s linear infinite;
+          }
         `}</style>
       </head>
       <body>
-        <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column" }}>
-          {/* Minimal Top Bar - No logo, no generic title, pure minimal tabs */}
-          <nav style={{
-            borderBottom: "1px solid #e5e7eb",
+        <div style={{ minHeight: "100vh", display: "flex" }}>
+          {/* Sidebar */}
+          <aside style={{
+            width: "230px",
+            minWidth: "230px",
+            borderRight: "1px solid #e5e7eb",
             background: "#ffffff",
-            padding: "0 24px",
             display: "flex",
-            alignItems: "center",
-            height: "52px",
-            gap: "28px",
-            fontSize: "14px",
-            fontWeight: 500,
+            flexDirection: "column",
+            position: "sticky",
+            top: 0,
+            height: "100vh",
+            padding: "24px 16px",
           }}>
-            <a href="/" style={{
+            <div style={{
+              fontSize: "12px",
+              fontWeight: 700,
+              letterSpacing: "0.08em",
+              color: "#374151",
+              marginBottom: "32px",
+              paddingLeft: "8px",
+            }}>
+              SECURITY GATEWAY
+            </div>
+
+            <nav style={{ display: "flex", flexDirection: "column", gap: "6px", flex: 1 }}>
+              <a href="/dashboard" style={{
+                display: "flex",
+                alignItems: "center",
+                padding: "9px 12px",
+                borderRadius: "6px",
+                fontSize: "14px",
+                fontWeight: 500,
+                color: "#4b5563",
+                background: "transparent",
+                transition: "background 0.15s ease",
+              }}>
+                Dashboard
+              </a>
+              <a href="/" style={{
+                display: "flex",
+                alignItems: "center",
+                padding: "9px 12px",
+                borderRadius: "6px",
+                fontSize: "14px",
+                fontWeight: 500,
+                color: "#111827",
+                background: "transparent",
+                transition: "background 0.15s ease",
+              }}>
+                Pipeline
+              </a>
+              <a href="/training-datasets" style={{
+                display: "flex",
+                alignItems: "center",
+                padding: "9px 12px",
+                borderRadius: "6px",
+                fontSize: "14px",
+                fontWeight: 500,
+                color: "#4b5563",
+                background: "transparent",
+                transition: "background 0.15s ease",
+              }}>
+                Training Datasets
+              </a>
+            </nav>
+
+            <div style={{
+              borderTop: "1px solid #f3f4f6",
+              paddingTop: "16px",
               display: "flex",
               alignItems: "center",
               gap: "8px",
-              color: "#111827",
-              fontWeight: 600,
-              padding: "16px 0",
-              borderBottom: "2px solid #111827",
-            }}>
-              Verification & Gateway
-            </a>
-            <a href="/data-collection" style={{
+              fontSize: "12px",
               color: "#6b7280",
-              padding: "16px 0",
             }}>
-              Data Collection (Ingestion)
-            </a>
-            <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: "16px", fontSize: "12px", color: "#6b7280" }}>
-              <span style={{ display: "inline-flex", alignItems: "center", gap: "6px" }}>
-                <span style={{ width: 8, height: 8, borderRadius: "50%", background: "#10b981" }}></span>
-                ML-DSA-65 Active
-              </span>
+              <span style={{ width: 7, height: 7, borderRadius: "50%", background: "#10b981", display: "inline-block" }}></span>
+              <span>ML-DSA-65 Active</span>
             </div>
-          </nav>
-          <div style={{ flex: 1 }}>
+          </aside>
+
+          {/* Main Content View */}
+          <main style={{ flex: 1, overflowX: "auto", minWidth: 0 }}>
             {children}
-          </div>
+          </main>
         </div>
       </body>
     </html>

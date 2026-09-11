@@ -89,7 +89,7 @@ async def test_opa_decisions():
     )
     assert res_unverified.decision == "REJECT"
 
-    # 2. High risk must QUARANTINE
+    # 2. High risk must REJECT
     res_high_risk = await evaluate_policy(
         cryptographic_verified=True,
         risk_score=85,
@@ -97,9 +97,19 @@ async def test_opa_decisions():
         high_severity_findings=2,
         pii_findings=1,
     )
-    assert res_high_risk.decision == "QUARANTINE"
+    assert res_high_risk.decision == "REJECT"
 
-    # 3. Clean verified dataset must APPROVE
+    # 3. Moderate risk must QUARANTINE
+    res_mod_risk = await evaluate_policy(
+        cryptographic_verified=True,
+        risk_score=40,
+        risk_level="MEDIUM",
+        high_severity_findings=0,
+        pii_findings=1,
+    )
+    assert res_mod_risk.decision == "QUARANTINE"
+
+    # 4. Clean verified dataset must APPROVE
     res_clean = await evaluate_policy(
         cryptographic_verified=True,
         risk_score=15,

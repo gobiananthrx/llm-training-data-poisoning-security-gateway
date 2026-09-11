@@ -136,3 +136,6 @@ def verify_provenance(
         )
     except Exception:
         return False
+
+
+verify_signature = verify_provenance

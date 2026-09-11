@@ -1,1055 +1,1343 @@
 "use client";
 
-import { useEffect, useState, useRef } from "react";
+import { useEffect, useState } from "react";
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000";
-const WS_BASE_URL = API_BASE_URL.replace(/^http/, "ws");
 
 interface StepItem {
   id: string;
   label: string;
   status: "idle" | "running" | "completed" | "failed";
-  details?: string;
 }
 
-const INITIAL_STEPS: StepItem[] = [
-  { id: "ingest", label: "Dataset Ingestion & Canonicalization", status: "idle" },
-  { id: "crypto", label: "Cryptographic Provenance & ML-DSA-65 Verification", status: "idle" },
-  { id: "semantic", label: "Semantic Threat Intelligence (Injection, Overrides)", status: "idle" },
-  { id: "behavioral", label: "Behavioral Threat Intelligence (Policy Bypass)", status: "idle" },
-  { id: "inconsistency", label: "Inconsistency & Contradiction Analysis", status: "idle" },
-  { id: "pii", label: "Presidio PII Detection (Names, Emails, Phones)", status: "idle" },
-  { id: "correlation", label: "Cross-Agent Evidence Correlation", status: "idle" },
-  { id: "risk", label: "Risk-Adaptive Scoring & Metric Calculation", status: "idle" },
-  { id: "opa", label: "OPA Policy Governance (Rego Evaluation)", status: "idle" },
+const STEP_DEFINITIONS: { id: string; label: string }[] = [
+  { id: "norm", label: "Normalization" },
+  { id: "crypto", label: "Cryptographic Integrity" },
+  { id: "semantic", label: "Semantic Intelligence" },
+  { id: "behavioral", label: "Behavioral Intelligence" },
+  { id: "inconsistency", label: "Inconsistency Intelligence" },
+  { id: "pii", label: "PII Detection" },
+  { id: "correlation", label: "Evidence Correlation" },
+  { id: "risk", label: "Risk Engine" },
+  { id: "policy", label: "Policy Governance" },
 ];
 
-export default function GatewayPage() {
-  const [datasetId, setDatasetId] = useState<string>("");
-  const [version, setVersion] = useState<number>(1);
-  const [file, setFile] = useState<File | null>(null);
+interface FileJob {
+  id: string;
+  file: File;
+  filename: string;
+  fileSize: number;
+  status: "idle" | "running" | "completed" | "blocked" | "failed";
+  blockedReason?: string;
+  steps: StepItem[];
+  datasetId?: string;
+  version?: number;
+  decision?: string;
+  riskScore?: number;
+  riskLevel?: string;
+  findingsCount?: number;
+}
 
-  const [steps, setSteps] = useState<StepItem[]>(INITIAL_STEPS);
-  const [pipelineRunning, setPipelineRunning] = useState(false);
-  const [pipelineError, setPipelineError] = useState<string | null>(null);
+interface DatasetItem {
+  dataset_id: string;
+  version: number;
+  filename: string;
+  file_type: string;
+  file_size: number;
+  sha256: string;
+  status: string;
+  created_at: string;
+  record_count: number | null;
+  risk_level: string | null;
+  risk_score: number | null;
+  opa_decision: string | null;
+  findings_count: number;
+  pii_count: number;
+}
 
-  const [verificationResult, setVerificationResult] = useState<any>(null);
-  const [analysisResult, setAnalysisResult] = useState<any>(null);
-  const [authorizationResult, setAuthorizationResult] = useState<any>(null);
+const ALL_AGENTS = ["semantic", "behavioral", "inconsistency", "pii"];
 
-  // Content & findings for viewer
-  const [contentData, setContentData] = useState<any>(null);
-  const [findingsData, setFindingsData] = useState<any>(null);
-  const [auditEvents, setAuditEvents] = useState<any[]>([]);
+export default function PipelineAndHITLPage() {
+  // --- Pipeline Upload State ---
+  const [jobs, setJobs] = useState<FileJob[]>([]);
+  const [isRunning, setIsRunning] = useState(false);
 
-  // Active drawer & edit state
-  const [selectedRecord, setSelectedRecord] = useState<any | null>(null);
-  const [activeTab, setActiveTab] = useState<"viewer" | "audit">("viewer");
-  const [editedCells, setEditedCells] = useState<Record<string, Record<string, string>>>({});
-  const [removedRecordIds, setRemovedRecordIds] = useState<string[]>([]);
-  const [reviewNotes, setReviewNotes] = useState<string>("");
-  const [reviewSubmitting, setReviewSubmitting] = useState(false);
+  // --- HITL State ---
+  const [datasets, setDatasets] = useState<DatasetItem[]>([]);
+  const [hitlLoading, setHitlLoading] = useState(false);
+  const [hitlError, setHitlError] = useState<string | null>(null);
 
-  const wsRef = useRef<WebSocket | null>(null);
+  // Expanded dataset inspection viewer: Set of dataset_id keys
+  const [expandedDatasets, setExpandedDatasets] = useState<Record<string, boolean>>({});
 
-  // Check query params on mount (e.g. ?id=DS-XXXX&version=1 from data collection)
+  // Active agent flag filters per dataset: dataset_id -> array of selected agents
+  const [agentFilters, setAgentFilters] = useState<Record<string, string[]>>({});
+
+  // Content & Findings cache per dataset (key: datasetId_version)
+  const [contentCache, setContentCache] = useState<Record<string, any>>({});
+  const [findingsCache, setFindingsCache] = useState<Record<string, any>>({});
+  const [loadingContent, setLoadingContent] = useState<Record<string, boolean>>({});
+
+  // Edit / Removal staging
+  const [modifiedRecords, setModifiedRecords] = useState<Record<string, Record<string, Record<string, string>>>>({});
+  const [removedRecords, setRemovedRecords] = useState<Record<string, string[]>>({});
+  const [submittingAction, setSubmittingAction] = useState<Record<string, boolean>>({});
+  const [actionNotice, setActionNotice] = useState<Record<string, { type: "success" | "error"; text: string }>>({});
+
+  // Cell Edit Modal State
+  const [editModalInfo, setEditModalInfo] = useState<{
+    datasetId: string;
+    version: number;
+    recordId: string;
+    field: string;
+    value: string;
+  } | null>(null);
+
+  // Selected Threat Details Drawer
+  const [selectedFinding, setSelectedFinding] = useState<any | null>(null);
+
   useEffect(() => {
-    if (typeof window !== "undefined") {
-      const urlParams = new URLSearchParams(window.location.search);
-      const qId = urlParams.get("id");
-      const qVer = urlParams.get("version");
-      if (qId) {
-        setDatasetId(qId);
-        setVersion(qVer ? parseInt(qVer, 10) : 1);
-      }
-    }
+    loadDatasets();
   }, []);
 
-  // Connect WebSocket when datasetId is active
-  useEffect(() => {
-    if (!datasetId) return;
-
+  async function loadDatasets() {
+    setHitlLoading(true);
+    setHitlError(null);
     try {
-      const ws = new WebSocket(`${WS_BASE_URL}/api/ws/${datasetId}`);
-      wsRef.current = ws;
-
-      ws.onmessage = (event) => {
-        try {
-          const msg = jsonParseSafe(event.data);
-          if (msg && msg.event) {
-            handlePipelineEvent(msg.event, msg.data);
-          }
-        } catch {
-          // ignore
-        }
-      };
-
-      ws.onclose = () => {
-        wsRef.current = null;
-      };
-
-      return () => {
-        ws.close();
-      };
-    } catch {
-      // ignore
-    }
-  }, [datasetId]);
-
-  function jsonParseSafe(str: string) {
-    try {
-      return JSON.parse(str);
-    } catch {
-      return null;
+      const res = await fetch(`${API_BASE_URL}/api/datasets/`);
+      if (!res.ok) throw new Error("Failed to load datasets");
+      const data: DatasetItem[] = await res.json();
+      // Sort LIFO (newest first)
+      const sorted = [...data].sort((a, b) => {
+        const timeA = new Date(a.created_at || 0).getTime();
+        const timeB = new Date(b.created_at || 0).getTime();
+        return timeB - timeA;
+      });
+      setDatasets(sorted);
+    } catch (err: any) {
+      setHitlError(err.message || "Failed to load datasets");
+    } finally {
+      setHitlLoading(false);
     }
   }
 
-  function updateStep(id: string, status: "idle" | "running" | "completed" | "failed", details?: string) {
-    setSteps((prev) =>
-      prev.map((s) => (s.id === id ? { ...s, status, details: details || s.details } : s))
+  function formatBytes(bytes: number): string {
+    if (!bytes || bytes === 0) return "0 B";
+    const k = 1024;
+    const sizes = ["B", "KB", "MB", "GB"];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + " " + sizes[i];
+  }
+
+  // --- Pipeline Upload & Execution Handlers ---
+  function handleFileSelection(e: React.ChangeEvent<HTMLInputElement>) {
+    if (!e.target.files || e.target.files.length === 0) return;
+    const selectedFiles = Array.from(e.target.files);
+
+    const newJobs: FileJob[] = selectedFiles.map((file, idx) => ({
+      id: `${Date.now()}-${idx}-${file.name}`,
+      file,
+      filename: file.name,
+      fileSize: file.size,
+      status: "idle",
+      steps: STEP_DEFINITIONS.map((def) => ({
+        id: def.id,
+        label: def.label,
+        status: "idle",
+      })),
+    }));
+
+    setJobs((prev) => [...prev, ...newJobs]);
+  }
+
+  function updateJobStep(jobId: string, stepId: string, status: "idle" | "running" | "completed" | "failed") {
+    setJobs((prev) =>
+      prev.map((j) => {
+        if (j.id !== jobId) return j;
+        return {
+          ...j,
+          steps: j.steps.map((s) => (s.id === stepId ? { ...s, status } : s)),
+        };
+      })
     );
   }
 
-  function handlePipelineEvent(eventType: string, data: any) {
-    switch (eventType) {
-      case "processing_started":
-        updateStep("ingest", "running");
-        break;
-      case "processing_completed":
-        updateStep("ingest", "completed", `${data?.records || 0} records normalized`);
-        break;
-      case "verification_started":
-        updateStep("crypto", "running");
-        break;
-      case "verification_completed":
-        updateStep("crypto", "completed", "SHA-256 & ML-DSA-65 verified");
-        break;
-      case "verification_failed":
-        updateStep("crypto", "failed", data?.reason || "Verification blocked");
-        break;
-      case "semantic_started":
-        updateStep("semantic", "running");
-        break;
-      case "semantic_completed":
-        updateStep("semantic", "completed", `${data?.findings_count || 0} findings (${data?.provider || "gemini"})`);
-        break;
-      case "behavioral_started":
-        updateStep("behavioral", "running");
-        break;
-      case "behavioral_completed":
-        updateStep("behavioral", "completed", `${data?.findings_count || 0} findings (${data?.provider || "gemini"})`);
-        break;
-      case "inconsistency_started":
-        updateStep("inconsistency", "running");
-        break;
-      case "inconsistency_completed":
-        updateStep("inconsistency", "completed", `${data?.findings_count || 0} findings (${data?.provider || "gemini"})`);
-        break;
-      case "pii_started":
-        updateStep("pii", "running");
-        break;
-      case "pii_completed":
-        updateStep("pii", "completed", `${data?.findings_count || 0} PII elements detected`);
-        break;
-      case "correlation_started":
-        updateStep("correlation", "running");
-        break;
-      case "correlation_completed":
-        updateStep("correlation", "completed", `${data?.correlated_count || 0} correlated findings`);
-        break;
-      case "risk_started":
-        updateStep("risk", "running");
-        break;
-      case "risk_completed":
-        updateStep("risk", "completed", `Risk Score: ${data?.risk_score}/100 (${data?.risk_level})`);
-        break;
-      case "opa_started":
-        updateStep("opa", "running");
-        break;
-      case "opa_completed":
-        updateStep("opa", "completed", `Decision: ${data?.decision}`);
-        break;
-      default:
-        break;
-    }
-  }
+  async function executeJob(job: FileJob) {
+    setJobs((prev) =>
+      prev.map((j) => (j.id === job.id ? { ...j, status: "running" } : j))
+    );
 
-  // Pre-training Verification & Security Gateway Pipeline
-  async function runGatewayWorkflow(targetId?: string, targetVer?: number) {
-    const activeId = targetId || datasetId;
-    const activeVer = targetVer || version;
+    // Normalization & Cryptographic Integrity animation
+    updateJobStep(job.id, "norm", "running");
+    await new Promise((r) => setTimeout(r, 350));
+    updateJobStep(job.id, "norm", "completed");
 
-    if (!activeId) {
-      setPipelineError("Please specify or ingest a Dataset ID first.");
-      return;
-    }
+    updateJobStep(job.id, "crypto", "running");
+    await new Promise((r) => setTimeout(r, 350));
 
-    setPipelineRunning(true);
-    setPipelineError(null);
-    setVerificationResult(null);
-    setAnalysisResult(null);
-    setAuthorizationResult(null);
-    setSelectedRecord(null);
-
-    // Reset steps to idle
-    setSteps(INITIAL_STEPS.map((s) => ({ ...s, status: "idle" })));
+    const formData = new FormData();
+    formData.append("file", job.file);
 
     try {
-      // Step 1: Pre-training cryptographic verification
-      updateStep("crypto", "running");
-      const verifyRes = await fetch(
-        `${API_BASE_URL}/api/datasets/${activeId}/versions/${activeVer}/verify`,
-        { method: "POST" }
-      );
-      const vData = await verifyRes.json();
-      setVerificationResult(vData);
+      const res = await fetch(`${API_BASE_URL}/api/datasets/pipeline-upload`, {
+        method: "POST",
+        body: formData,
+      });
 
-      if (!verifyRes.ok || vData.verification_status !== "VERIFIED") {
-        updateStep("crypto", "failed", vData.reason || "Cryptographic verification failed.");
-        setPipelineRunning(false);
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || "Pipeline upload failed");
+
+      if (data.blocked) {
+        updateJobStep(job.id, "crypto", "failed");
+        setJobs((prev) =>
+          prev.map((j) =>
+            j.id === job.id
+              ? {
+                  ...j,
+                  status: "blocked",
+                  blockedReason: data.reason || "Cryptographic verification failed.",
+                  datasetId: data.dataset_id,
+                  version: data.version,
+                  decision: "REJECT",
+                  riskScore: 100,
+                }
+              : j
+          )
+        );
+        await loadDatasets();
         return;
       }
-      updateStep("crypto", "completed", "SHA-256, Provenance, and ML-DSA-65 Valid");
 
-      // Step 2: Trigger LangGraph security pipeline
-      const analyzeRes = await fetch(
-        `${API_BASE_URL}/api/datasets/${activeId}/versions/${activeVer}/analyze`,
-        { method: "POST" }
-      );
-      const aData = await analyzeRes.json();
-      if (!analyzeRes.ok) {
-        throw new Error(aData.detail || "Security pipeline execution failed.");
+      updateJobStep(job.id, "crypto", "completed");
+
+      // Animate remaining intelligence steps
+      const remaining = ["semantic", "behavioral", "inconsistency", "pii", "correlation", "risk", "policy"];
+      for (const stepId of remaining) {
+        updateJobStep(job.id, stepId, "running");
+        await new Promise((r) => setTimeout(r, 160));
+        updateJobStep(job.id, stepId, "completed");
       }
-      setAnalysisResult(aData);
 
-      // Step 3: Fetch findings & content for interactive viewer
-      await loadDatasetContentAndFindings(activeId, activeVer);
-
-      // Step 4: Check Training Authorization Gate
-      const authRes = await fetch(
-        `${API_BASE_URL}/api/datasets/${activeId}/versions/${activeVer}/authorization`
+      setJobs((prev) =>
+        prev.map((j) =>
+          j.id === job.id
+            ? {
+                ...j,
+                status: "completed",
+                datasetId: data.dataset_id,
+                version: data.version,
+                decision: data.decision || "APPROVE",
+                riskScore: data.risk_score ?? 0,
+                riskLevel: data.risk_level || "LOW",
+                findingsCount: data.findings_count ?? 0,
+              }
+            : j
+        )
       );
-      if (authRes.ok) {
-        const authData = await authRes.json();
-        setAuthorizationResult(authData);
-      }
+
+      // Refresh HITL section below so the new dataset is visible at the top (LIFO)
+      await loadDatasets();
     } catch (err: any) {
-      setPipelineError(err.message || "Pipeline failed.");
-    } finally {
-      setPipelineRunning(false);
+      updateJobStep(job.id, "crypto", "failed");
+      setJobs((prev) =>
+        prev.map((j) =>
+          j.id === job.id
+            ? { ...j, status: "failed", blockedReason: err.message || "Pipeline execution failed" }
+            : j
+        )
+      );
     }
   }
 
-  async function loadDatasetContentAndFindings(id: string, ver: number) {
+  async function handleRunAll() {
+    if (jobs.length === 0 || isRunning) return;
+    setIsRunning(true);
+    const pendingJobs = jobs.filter((j) => j.status === "idle" || j.status === "failed");
+    await Promise.all(pendingJobs.map((job) => executeJob(job)));
+    setIsRunning(false);
+  }
+
+  // --- HITL Handlers ---
+  async function toggleExpandDataset(ds: DatasetItem) {
+    const key = ds.dataset_id;
+    const isCurrentlyExpanded = !!expandedDatasets[key];
+    const nextState = !isCurrentlyExpanded;
+
+    setExpandedDatasets((prev) => ({ ...prev, [key]: nextState }));
+
+    if (nextState) {
+      // Set default filters if not initialized
+      if (!agentFilters[key]) {
+        setAgentFilters((prev) => ({ ...prev, [key]: [...ALL_AGENTS] }));
+      }
+      // Load content and findings if not cached
+      const cacheKey = `${ds.dataset_id}_v${ds.version}`;
+      if (!contentCache[cacheKey]) {
+        await loadDatasetContent(ds.dataset_id, ds.version);
+      }
+    }
+  }
+
+  async function loadDatasetContent(dsId: string, ver: number) {
+    const cacheKey = `${dsId}_v${ver}`;
+    setLoadingContent((prev) => ({ ...prev, [dsId]: true }));
     try {
-      const [cRes, fRes, aRes] = await Promise.all([
-        fetch(`${API_BASE_URL}/api/datasets/${id}/versions/${ver}/content`),
-        fetch(`${API_BASE_URL}/api/datasets/${id}/versions/${ver}/findings`),
-        fetch(`${API_BASE_URL}/api/datasets/${id}/versions/${ver}/audit`),
+      const [cRes, fRes] = await Promise.all([
+        fetch(`${API_BASE_URL}/api/datasets/${dsId}/versions/${ver}/content?page=1&page_size=100`),
+        fetch(`${API_BASE_URL}/api/datasets/${dsId}/versions/${ver}/findings`),
       ]);
 
-      if (cRes.ok) setContentData(await cRes.json());
-      if (fRes.ok) setFindingsData(await fRes.json());
-      if (aRes.ok) setAuditEvents(await aRes.json());
+      if (cRes.ok) {
+        const cData = await cRes.json();
+        setContentCache((prev) => ({ ...prev, [cacheKey]: cData }));
+      }
+      if (fRes.ok) {
+        const fData = await fRes.json();
+        setFindingsCache((prev) => ({ ...prev, [cacheKey]: fData }));
+      }
     } catch {
       // ignore
+    } finally {
+      setLoadingContent((prev) => ({ ...prev, [dsId]: false }));
     }
   }
 
-  // Handle file selection directly on /
-  async function handleDirectFileUploadAndRun() {
-    if (!file) return;
+  function toggleAgentFilter(dsId: string, agent: string) {
+    setAgentFilters((prev) => {
+      const current = prev[dsId] || [...ALL_AGENTS];
+      if (current.includes(agent)) {
+        return { ...prev, [dsId]: current.filter((a) => a !== agent) };
+      } else {
+        return { ...prev, [dsId]: [...current, agent] };
+      }
+    });
+  }
 
-    setPipelineRunning(true);
-    setPipelineError(null);
+  function selectAllAgents(dsId: string) {
+    setAgentFilters((prev) => ({ ...prev, [dsId]: [...ALL_AGENTS] }));
+  }
 
-    const form = new FormData();
-    form.append("file", file);
-    form.append("source", "gateway_direct_upload");
+  function clearAllAgents(dsId: string) {
+    setAgentFilters((prev) => ({ ...prev, [dsId]: [] }));
+  }
 
-    try {
-      const res = await fetch(`${API_BASE_URL}/api/datasets/upload`, {
-        method: "POST",
-        body: form,
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.detail || "Direct upload failed");
+  // Cell Finding Matcher: checks exact column and enabled agent filter
+  function getCellFinding(findings: any[], rec: any, col: string, activeAgents: string[]) {
+    if (!findings || findings.length === 0) return null;
+    const recId = String(rec.record_id);
 
-      setDatasetId(data.dataset_id);
-      setVersion(data.version);
+    return findings.find((f: any) => {
+      if (String(f.record_id) !== recId) return false;
+      const agentLower = (f.agent || "").toLowerCase();
+      if (!activeAgents.includes(agentLower)) return false;
 
-      // Immediately run pre-training verification and security analysis
-      await runGatewayWorkflow(data.dataset_id, data.version);
-    } catch (err: any) {
-      setPipelineError(err.message || "Upload failed");
-      setPipelineRunning(false);
+      const fCol = f.location?.field || f.field;
+      if (fCol === col) return true;
+      if ((fCol === "text" || !fCol) && (col.toLowerCase().includes("text") || col.toLowerCase().includes("content") || col.toLowerCase().includes("instruction") || col.toLowerCase().includes("query") || col.toLowerCase().includes("prompt"))) {
+        return true;
+      }
+      return false;
+    });
+  }
+
+  function getAgentBadgeColor(agent: string) {
+    switch (agent?.toLowerCase()) {
+      case "semantic":
+        return { bg: "#fef2f2", text: "#991b1b", border: "#fecaca", dot: "#ef4444" };
+      case "behavioral":
+        return { bg: "#fff7ed", text: "#9a3412", border: "#fed7aa", dot: "#f97316" };
+      case "inconsistency":
+        return { bg: "#fefce8", text: "#854d0e", border: "#fef08a", dot: "#eab308" };
+      case "pii":
+        return { bg: "#eff6ff", text: "#1e40af", border: "#bfdbfe", dot: "#3b82f6" };
+      default:
+        return { bg: "#f3f4f6", text: "#374151", border: "#e5e7eb", dot: "#6b7280" };
     }
   }
 
-  // HITL: Cell editing
-  function handleCellEdit(recId: string, field: string, val: string) {
-    setEditedCells((prev) => ({
-      ...prev,
-      [recId]: {
-        ...(prev[recId] || {}),
-        [field]: val,
-      },
-    }));
-  }
+  // Decision actions for ANY dataset
+  async function submitDecision(datasetId: string, version: number, action: "APPROVE" | "REJECT") {
+    setSubmittingAction((prev) => ({ ...prev, [datasetId]: true }));
+    setActionNotice((prev) => ({ ...prev, [datasetId]: { type: "success", text: `Submitting ${action}...` } }));
 
-  // HITL: Mark row for removal
-  function toggleRowRemoval(recId: string) {
-    setRemovedRecordIds((prev) =>
-      prev.includes(recId) ? prev.filter((id) => id !== recId) : [...prev, recId]
-    );
-  }
-
-  // HITL Review submission: Approve, Reject, or Modify/Remove -> creates Version N+1
-  async function submitReviewAction(action: "APPROVE" | "REJECT" | "MODIFY") {
-    if (!datasetId) return;
-
-    setReviewSubmitting(true);
     try {
-      const modified_records = Object.entries(editedCells).map(([recId, data]) => ({
-        record_id: recId,
-        data,
-      }));
-
-      const payload = {
-        action,
-        notes: reviewNotes,
-        modified_records: modified_records.length > 0 ? modified_records : null,
-        removed_record_ids: removedRecordIds.length > 0 ? removedRecordIds : null,
-      };
-
       const res = await fetch(
         `${API_BASE_URL}/api/datasets/${datasetId}/versions/${version}/review`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload),
+          body: JSON.stringify({
+            action,
+            notes: `Decision marked as ${action} by security auditor in HITL view`,
+            modified_records: [],
+            removed_record_ids: [],
+          }),
+        }
+      );
+
+      if (!res.ok) throw new Error(`Failed to submit ${action}`);
+      setActionNotice((prev) => ({
+        ...prev,
+        [datasetId]: { type: "success", text: `Dataset marked as ${action} successfully.` },
+      }));
+      await loadDatasets();
+    } catch (err: any) {
+      setActionNotice((prev) => ({
+        ...prev,
+        [datasetId]: { type: "error", text: err.message || `Action failed` },
+      }));
+    } finally {
+      setSubmittingAction((prev) => ({ ...prev, [datasetId]: false }));
+    }
+  }
+
+  // Row removal toggle
+  function toggleRowRemoval(dsId: string, recId: string) {
+    const sId = String(recId);
+    setRemovedRecords((prev) => {
+      const list = prev[dsId] || [];
+      if (list.includes(sId)) {
+        return { ...prev, [dsId]: list.filter((id) => id !== sId) };
+      } else {
+        return { ...prev, [dsId]: [...list, sId] };
+      }
+    });
+  }
+
+  // Save cell edit into staging
+  function saveCellEdit() {
+    if (!editModalInfo) return;
+    const { datasetId, recordId, field, value } = editModalInfo;
+
+    setModifiedRecords((prev) => {
+      const dsMods = prev[datasetId] || {};
+      const recMods = dsMods[recordId] || {};
+      return {
+        ...prev,
+        [datasetId]: {
+          ...dsMods,
+          [recordId]: {
+            ...recMods,
+            [field]: value,
+          },
+        },
+      };
+    });
+
+    setEditModalInfo(null);
+  }
+
+  // Submit modifications and rerun pipeline to generate vN+1
+  async function submitRemediation(dsId: string, currVersion: number) {
+    setSubmittingAction((prev) => ({ ...prev, [dsId]: true }));
+    setActionNotice((prev) => ({ ...prev, [dsId]: { type: "success", text: "Remediating and generating next version..." } }));
+
+    const dsMods = modifiedRecords[dsId] || {};
+    const modsList = Object.entries(dsMods).map(([rId, fields]) => ({
+      record_id: rId,
+      data: fields,
+    }));
+    const dsRemovals = removedRecords[dsId] || [];
+
+    try {
+      const res = await fetch(
+        `${API_BASE_URL}/api/datasets/${dsId}/versions/${currVersion}/review`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            action: "MODIFY",
+            notes: "Remediated adversarial findings and generated next version",
+            modified_records: modsList,
+            removed_record_ids: dsRemovals,
+          }),
         }
       );
 
       const data = await res.json();
-      if (!res.ok) throw new Error(data.detail || "Review submission failed");
+      if (!res.ok) throw new Error(data.detail || "Remediation rerun failed");
 
-      // If Version N+1 was created
-      if (data.new_version) {
-        setVersion(data.new_version);
-        setEditedCells({});
-        setRemovedRecordIds([]);
-        setReviewNotes("");
-        setSelectedRecord(null);
-        await runGatewayWorkflow(datasetId, data.new_version);
-      } else {
-        // Refresh authorization and findings
-        await loadDatasetContentAndFindings(datasetId, version);
-        const authRes = await fetch(
-          `${API_BASE_URL}/api/datasets/${datasetId}/versions/${version}/authorization`
-        );
-        if (authRes.ok) setAuthorizationResult(await authRes.json());
-      }
+      // Reset staging for this dataset
+      setModifiedRecords((prev) => ({ ...prev, [dsId]: {} }));
+      setRemovedRecords((prev) => ({ ...prev, [dsId]: [] }));
+
+      const newVer = data.new_version || currVersion + 1;
+      setActionNotice((prev) => ({
+        ...prev,
+        [dsId]: {
+          type: "success",
+          text: `Version ${newVer} generated. Re-evaluated decision: ${data.pipeline_result?.decision || "APPROVED"}, Risk: ${data.pipeline_result?.risk_score ?? 0}/100.`,
+        },
+      }));
+
+      await loadDatasets();
+      await loadDatasetContent(dsId, newVer);
     } catch (err: any) {
-      alert(`Review error: ${err.message}`);
+      setActionNotice((prev) => ({
+        ...prev,
+        [dsId]: { type: "error", text: err.message || "Remediation failed" },
+      }));
     } finally {
-      setReviewSubmitting(false);
+      setSubmittingAction((prev) => ({ ...prev, [dsId]: false }));
     }
   }
 
-  // Helper: map findings to record IDs
-  const findingsByRecord = (findingsData?.findings || []).reduce(
-    (acc: Record<string, any[]>, f: any) => {
-      const rid = String(f.record_id);
-      if (!acc[rid]) acc[rid] = [];
-      acc[rid].push(f);
-      return acc;
-    },
-    {}
-  );
-
-  const correlatedByRecord = (findingsData?.correlated_findings || []).reduce(
-    (acc: Record<string, any>, cf: any) => {
-      acc[String(cf.record_id)] = cf;
-      return acc;
-    },
-    {}
-  );
-
   return (
-    <div style={{ maxWidth: 1100, margin: "32px auto", padding: "0 24px" }}>
-      {/* Upper Control Bar: Minimal Entry */}
+    <div style={{ padding: "40px 48px", maxWidth: "1360px", margin: "0 auto" }}>
+      {/* ============================================================ */}
+      {/* PIPELINE SECTION                                             */}
+      {/* ============================================================ */}
+      <div style={{ marginBottom: "28px" }}>
+        <h1 style={{ fontSize: "24px", fontWeight: 700, color: "#111827", marginBottom: "6px" }}>
+          Pipeline
+        </h1>
+        <p style={{ fontSize: "14px", color: "#6b7280" }}>
+          Pre-training cryptographic verification, multi-agent adversarial threat intelligence, and risk-adaptive governance.
+        </p>
+      </div>
+
+      {/* Upload Dropzone */}
       <div style={{
         background: "#ffffff",
-        border: "1px solid #e5e7eb",
-        borderRadius: 8,
-        padding: 20,
-        marginBottom: 24,
-        display: "flex",
-        flexWrap: "wrap",
-        alignItems: "center",
-        justifyContent: "space-between",
-        gap: 16,
+        border: "1px dashed #d1d5db",
+        borderRadius: "8px",
+        padding: "36px 24px",
+        textAlign: "center",
+        marginBottom: "32px",
       }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 12, flex: "1 1 340px" }}>
-          <div style={{ flex: 1 }}>
-            <label style={{ display: "block", fontSize: 11, fontWeight: 600, color: "#4b5563", textTransform: "uppercase", marginBottom: 4 }}>
-              Active Dataset ID
-            </label>
-            <input
-              type="text"
-              placeholder="e.g. DS-A91F82C31D22"
-              value={datasetId}
-              onChange={(e) => setDatasetId(e.target.value)}
-              style={{
-                width: "100%",
-                padding: "7px 12px",
-                border: "1px solid #d1d5db",
-                borderRadius: 5,
-                fontSize: 13,
-                fontFamily: "monospace",
-              }}
-            />
-          </div>
-          <div style={{ width: 80 }}>
-            <label style={{ display: "block", fontSize: 11, fontWeight: 600, color: "#4b5563", textTransform: "uppercase", marginBottom: 4 }}>
-              Version
-            </label>
-            <input
-              type="number"
-              min={1}
-              value={version}
-              onChange={(e) => setVersion(parseInt(e.target.value, 10) || 1)}
-              style={{
-                width: "100%",
-                padding: "7px 10px",
-                border: "1px solid #d1d5db",
-                borderRadius: 5,
-                fontSize: 13,
-              }}
-            />
-          </div>
-          <button
-            onClick={() => runGatewayWorkflow()}
-            disabled={!datasetId || pipelineRunning}
-            style={{
-              marginTop: 18,
-              background: !datasetId || pipelineRunning ? "#9ca3af" : "#111827",
-              color: "#ffffff",
-              border: "none",
-              padding: "8px 16px",
-              borderRadius: 5,
-              fontSize: 13,
-              fontWeight: 500,
-            }}
-          >
-            {pipelineRunning ? "Verifying..." : "Run Security Gateway"}
-          </button>
+        <div style={{ fontSize: "15px", fontWeight: 600, color: "#111827", marginBottom: "8px" }}>
+          Select or drop dataset files to run pipeline
         </div>
+        <p style={{ fontSize: "13px", color: "#6b7280", marginBottom: "16px" }}>
+          Supports CSV, JSON, TXT, and XLSX datasets
+        </p>
 
-        <div style={{ display: "flex", alignItems: "center", gap: 8, borderLeft: "1px solid #e5e7eb", paddingLeft: 16 }}>
+        <div>
           <input
             type="file"
-            id="direct-file-input"
-            accept=".csv,.json,.txt,.xlsx"
-            disabled={pipelineRunning}
-            onChange={(e) => {
-              if (e.target.files?.[0]) setFile(e.target.files[0]);
-            }}
-            style={{ display: "none" }}
+            multiple
+            onChange={handleFileSelection}
+            disabled={isRunning}
+            style={{ fontSize: "13px", color: "#4b5563" }}
           />
-          <label
-            htmlFor="direct-file-input"
-            style={{
-              display: "inline-block",
-              background: "#f9fafb",
-              border: "1px solid #d1d5db",
-              padding: "7px 12px",
-              borderRadius: 5,
-              fontSize: 12,
-              color: "#374151",
-              cursor: "pointer",
-            }}
-          >
-            {file ? file.name.slice(0, 18) : "Select local file"}
-          </label>
-          <button
-            onClick={handleDirectFileUploadAndRun}
-            disabled={!file || pipelineRunning}
-            style={{
-              background: !file || pipelineRunning ? "#e5e7eb" : "#2563eb",
-              color: !file || pipelineRunning ? "#9ca3af" : "#ffffff",
-              border: "none",
-              padding: "7px 14px",
-              borderRadius: 5,
-              fontSize: 12,
-              fontWeight: 500,
-            }}
-          >
-            Upload & Run
-          </button>
         </div>
+
+        {jobs.length > 0 && (
+          <div style={{ marginTop: "20px" }}>
+            <button
+              onClick={handleRunAll}
+              disabled={isRunning || jobs.every((j) => j.status === "completed")}
+              style={{
+                background: isRunning ? "#9ca3af" : "#111827",
+                color: "#ffffff",
+                border: "none",
+                padding: "9px 24px",
+                borderRadius: "6px",
+                fontSize: "14px",
+                fontWeight: 600,
+              }}
+            >
+              {isRunning ? "Executing Pipeline..." : "Execute Pipeline"}
+            </button>
+          </div>
+        )}
       </div>
 
-      {pipelineError && (
-        <div style={{
-          padding: 12,
-          background: "#fef2f2",
-          border: "1px solid #fecaca",
-          borderRadius: 6,
-          color: "#b91c1c",
-          fontSize: 13,
-          marginBottom: 20,
-        }}>
-          {pipelineError}
-        </div>
-      )}
-
-      {/* Real-Time Green Tick Execution Steps */}
-      <div style={{
-        background: "#ffffff",
-        border: "1px solid #e5e7eb",
-        borderRadius: 8,
-        padding: "20px 24px",
-        marginBottom: 24,
-      }}>
-        <div style={{ fontSize: 13, fontWeight: 600, color: "#374151", marginBottom: 14 }}>
-          Security Execution Lifecycle
-        </div>
-
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(290px, 1fr))", gap: 10 }}>
-          {steps.map((step) => (
+      {/* Individual File Pipeline Cards */}
+      {jobs.length > 0 && (
+        <div style={{ display: "flex", flexDirection: "column", gap: "24px", marginBottom: "48px" }}>
+          {jobs.map((job) => (
             <div
-              key={step.id}
+              key={job.id}
               style={{
+                background: "#ffffff",
+                border: "1px solid #e5e7eb",
+                borderRadius: "8px",
+                padding: "24px",
+              }}
+            >
+              {/* Job Header */}
+              <div style={{
                 display: "flex",
-                alignItems: "flex-start",
-                gap: 10,
-                padding: "8px 12px",
-                borderRadius: 6,
-                background: step.status === "completed" ? "#f0fdf4" : step.status === "failed" ? "#fef2f2" : "#f9fafb",
-                border: `1px solid ${
-                  step.status === "completed" ? "#bbf7d0" : step.status === "failed" ? "#fecaca" : "#f3f4f6"
-                }`,
-              }}
-            >
-              <div style={{ marginTop: 1, fontSize: 14 }}>
-                {step.status === "completed" && <span style={{ color: "#16a34a", fontWeight: "bold" }}>✓</span>}
-                {step.status === "running" && <span style={{ color: "#2563eb", animation: "pulse 1s infinite" }}>●</span>}
-                {step.status === "failed" && <span style={{ color: "#dc2626", fontWeight: "bold" }}>✗</span>}
-                {step.status === "idle" && <span style={{ color: "#d1d5db" }}>○</span>}
-              </div>
-              <div style={{ flex: 1, minWidth: 0 }}>
-                <div style={{
-                  fontSize: 12,
-                  fontWeight: step.status === "completed" ? 600 : 500,
-                  color: step.status === "completed" ? "#15803d" : step.status === "failed" ? "#b91c1c" : "#374151",
-                }}>
-                  {step.label}
+                alignItems: "center",
+                justifyContent: "space-between",
+                marginBottom: "20px",
+                borderBottom: "1px solid #f3f4f6",
+                paddingBottom: "14px",
+              }}>
+                <div>
+                  <span style={{ fontSize: "15px", fontWeight: 700, color: "#111827", marginRight: "12px" }}>
+                    {job.filename}
+                  </span>
+                  <span style={{ fontSize: "12px", color: "#6b7280" }}>
+                    {formatBytes(job.fileSize)}
+                  </span>
                 </div>
-                {step.details && (
-                  <div style={{ fontSize: 11, color: "#6b7280", marginTop: 2 }}>
-                    {step.details}
-                  </div>
-                )}
-              </div>
-            </div>
-          ))}
-        </div>
-      </div>
 
-      {/* Verification Failure Banner */}
-      {verificationResult && verificationResult.verification_status === "BLOCKED" && (
-        <div style={{
-          background: "#fef2f2",
-          border: "1px solid #f87171",
-          borderRadius: 8,
-          padding: 18,
-          marginBottom: 24,
-          color: "#991b1b",
-        }}>
-          <div style={{ fontWeight: 700, fontSize: 15, marginBottom: 4 }}>
-            ✗ Cryptographic Integrity Verification Failed — Dataset Blocked
-          </div>
-          <div style={{ fontSize: 13, marginBottom: 8 }}>
-            Reason: {verificationResult.reason}
-          </div>
-          <div style={{ fontSize: 12, color: "#7f1d1d" }}>
-            The dataset file on disk does not match the signed ML-DSA-65 provenance attestation. It has been strictly blocked from proceeding to training or model workflows.
-          </div>
-        </div>
-      )}
-
-      {/* Training Access Gate Card (If Approved) */}
-      {authorizationResult && authorizationResult.training_authorized && (
-        <div style={{
-          background: "#f0fdf4",
-          border: "2px solid #22c55e",
-          borderRadius: 8,
-          padding: 24,
-          marginBottom: 24,
-        }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 10, color: "#15803d", fontWeight: 700, fontSize: 16, marginBottom: 12 }}>
-            <span style={{ fontSize: 20 }}>✓</span> Dataset Approved for Training
-          </div>
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: 16, fontSize: 13 }}>
-            <div>
-              <div style={{ color: "#4b5563", fontSize: 11, textTransform: "uppercase", fontWeight: 600 }}>Dataset ID</div>
-              <div style={{ fontFamily: "monospace", fontWeight: 600, color: "#111827", marginTop: 2 }}>{authorizationResult.dataset_id}</div>
-            </div>
-            <div>
-              <div style={{ color: "#4b5563", fontSize: 11, textTransform: "uppercase", fontWeight: 600 }}>Version</div>
-              <div style={{ fontWeight: 600, color: "#111827", marginTop: 2 }}>v{authorizationResult.version}</div>
-            </div>
-            <div>
-              <div style={{ color: "#4b5563", fontSize: 11, textTransform: "uppercase", fontWeight: 600 }}>Risk Level</div>
-              <div style={{ fontWeight: 600, color: "#15803d", marginTop: 2 }}>{authorizationResult.risk_level} ({authorizationResult.risk_score}/100)</div>
-            </div>
-            <div>
-              <div style={{ color: "#4b5563", fontSize: 11, textTransform: "uppercase", fontWeight: 600 }}>OPA Decision</div>
-              <div style={{ fontWeight: 600, color: "#15803d", marginTop: 2 }}>{authorizationResult.opa_decision}</div>
-            </div>
-          </div>
-          <div style={{ marginTop: 16, paddingTop: 12, borderTop: "1px solid #bbf7d0", fontSize: 11, color: "#4b5563" }}>
-            Fingerprint: <code style={{ fontFamily: "monospace", color: "#111827" }}>{authorizationResult.sha256}</code>
-            <span style={{ marginLeft: 16 }}>Authorized at: {authorizationResult.authorized_at || "Verified"}</span>
-          </div>
-        </div>
-      )}
-
-      {/* Quarantined Status Banner */}
-      {analysisResult && analysisResult.decision === "QUARANTINE" && (
-        <div style={{
-          background: "#fffbeb",
-          border: "1px solid #fcd34d",
-          borderRadius: 8,
-          padding: 18,
-          marginBottom: 24,
-          color: "#92400e",
-        }}>
-          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-            <div>
-              <div style={{ fontWeight: 700, fontSize: 15, marginBottom: 2 }}>
-                ⚠️ Dataset Quarantined for Human-In-The-Loop Review
-              </div>
-              <div style={{ fontSize: 13 }}>
-                Assigned Risk Score: <strong>{analysisResult.risk_score}/100 ({analysisResult.risk_level})</strong> with {analysisResult.findings_count} security findings.
-              </div>
-            </div>
-            <div style={{ fontSize: 12, color: "#78350f" }}>
-              Click on highlighted records below to inspect evidence, edit cells, or remove rows.
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Main Tabs: Dataset Viewer & Audit Trail */}
-      {contentData && (
-        <div style={{ background: "#ffffff", border: "1px solid #e5e7eb", borderRadius: 8, overflow: "hidden", marginBottom: 32 }}>
-          <div style={{ display: "flex", borderBottom: "1px solid #e5e7eb", background: "#f9fafb" }}>
-            <button
-              onClick={() => setActiveTab("viewer")}
-              style={{
-                padding: "12px 20px",
-                border: "none",
-                background: activeTab === "viewer" ? "#ffffff" : "transparent",
-                borderBottom: activeTab === "viewer" ? "2px solid #111827" : "none",
-                fontWeight: activeTab === "viewer" ? 600 : 500,
-                fontSize: 13,
-                color: activeTab === "viewer" ? "#111827" : "#6b7280",
-              }}
-            >
-              Interactive Dataset Viewer ({contentData.record_count} Records)
-            </button>
-            <button
-              onClick={() => setActiveTab("audit")}
-              style={{
-                padding: "12px 20px",
-                border: "none",
-                background: activeTab === "audit" ? "#ffffff" : "transparent",
-                borderBottom: activeTab === "audit" ? "2px solid #111827" : "none",
-                fontWeight: activeTab === "audit" ? 600 : 500,
-                fontSize: 13,
-                color: activeTab === "audit" ? "#111827" : "#6b7280",
-              }}
-            >
-              Audit Trail ({auditEvents.length} Events)
-            </button>
-            <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 14, paddingRight: 16, fontSize: 11 }}>
-              <span style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
-                <span style={{ width: 10, height: 10, borderRadius: 2, background: "#ef4444" }}></span> Semantic
-              </span>
-              <span style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
-                <span style={{ width: 10, height: 10, borderRadius: 2, background: "#f97316" }}></span> Behavioral
-              </span>
-              <span style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
-                <span style={{ width: 10, height: 10, borderRadius: 2, background: "#eab308" }}></span> Inconsistency
-              </span>
-              <span style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
-                <span style={{ width: 10, height: 10, borderRadius: 2, background: "#3b82f6" }}></span> PII
-              </span>
-            </div>
-          </div>
-
-          {activeTab === "viewer" && (
-            <div style={{ display: "flex", position: "relative" }}>
-              {/* Dataset Table View */}
-              <div style={{ flex: 1, overflowX: "auto", maxHeight: 560 }}>
-                <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12, textAlign: "left" }}>
-                  <thead style={{ position: "sticky", top: 0, background: "#f9fafb", zIndex: 10 }}>
-                    <tr style={{ borderBottom: "1px solid #e5e7eb", color: "#4b5563" }}>
-                      <th style={{ padding: "8px 12px", width: 60 }}># ID</th>
-                      {contentData.columns.map((col: string) => (
-                        <th key={col} style={{ padding: "8px 12px", fontWeight: 600 }}>
-                          {col}
-                        </th>
-                      ))}
-                      <th style={{ padding: "8px 12px", width: 90, textAlign: "center" }}>Findings</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {contentData.records.map((r: any) => {
-                      const recId = String(r.record_id);
-                      const recFindings = findingsByRecord[recId] || [];
-                      const correlated = correlatedByRecord[recId];
-                      const isRemoved = removedRecordIds.includes(recId);
-                      const hasSemantic = recFindings.some((f: any) => f.agent === "semantic");
-                      const hasBehavioral = recFindings.some((f: any) => f.agent === "behavioral");
-                      const hasInconsistency = recFindings.some((f: any) => f.agent === "inconsistency");
-                      const hasPii = recFindings.some((f: any) => f.agent === "pii");
-
-                      return (
-                        <tr
-                          key={recId}
-                          onClick={() => setSelectedRecord({ ...r, findings: recFindings, correlated })}
-                          style={{
-                            borderBottom: "1px solid #f3f4f6",
-                            cursor: "pointer",
-                            background: isRemoved
-                              ? "#fee2e2"
-                              : selectedRecord?.record_id === r.record_id
-                              ? "#f0f9ff"
-                              : recFindings.length > 0
-                              ? "#fffdf5"
-                              : "#ffffff",
-                            textDecoration: isRemoved ? "line-through" : "none",
-                          }}
-                        >
-                          <td style={{ padding: "8px 12px", fontFamily: "monospace", color: "#6b7280" }}>
-                            {recId}
-                          </td>
-                          {contentData.columns.map((col: string) => {
-                            const val = editedCells[recId]?.[col] !== undefined ? editedCells[recId][col] : r.data[col] || "";
-                            const fieldFlagged = recFindings.some((f: any) => f.field === col);
-
-                            return (
-                              <td
-                                key={col}
-                                style={{
-                                  padding: "8px 12px",
-                                  maxWidth: 240,
-                                  overflow: "hidden",
-                                  textOverflow: "ellipsis",
-                                  whiteSpace: "nowrap",
-                                  background: fieldFlagged ? "rgba(254, 240, 138, 0.25)" : "transparent",
-                                }}
-                              >
-                                {val}
-                              </td>
-                            );
-                          })}
-                          <td style={{ padding: "8px 12px", textAlign: "center" }}>
-                            <div style={{ display: "inline-flex", gap: 3 }}>
-                              {hasSemantic && (
-                                <span title="Semantic Agent Flag" style={{ width: 8, height: 8, borderRadius: "50%", background: "#ef4444" }} />
-                              )}
-                              {hasBehavioral && (
-                                <span title="Behavioral Agent Flag" style={{ width: 8, height: 8, borderRadius: "50%", background: "#f97316" }} />
-                              )}
-                              {hasInconsistency && (
-                                <span title="Inconsistency Flag" style={{ width: 8, height: 8, borderRadius: "50%", background: "#eab308" }} />
-                              )}
-                              {hasPii && (
-                                <span title="Presidio PII Flag" style={{ width: 8, height: 8, borderRadius: "50%", background: "#3b82f6" }} />
-                              )}
-                            </div>
-                          </td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
+                <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
+                  <span style={{
+                    padding: "3px 10px",
+                    borderRadius: "4px",
+                    fontSize: "12px",
+                    fontWeight: 600,
+                    background:
+                      job.status === "completed"
+                        ? "#ecfdf5"
+                        : job.status === "blocked" || job.status === "failed"
+                        ? "#fef2f2"
+                        : job.status === "running"
+                        ? "#eff6ff"
+                        : "#f3f4f6",
+                    color:
+                      job.status === "completed"
+                        ? "#065f46"
+                        : job.status === "blocked" || job.status === "failed"
+                        ? "#991b1b"
+                        : job.status === "running"
+                        ? "#1e40af"
+                        : "#374151",
+                  }}>
+                    {job.status === "completed"
+                      ? `Completed: ${job.decision}`
+                      : job.status === "blocked"
+                      ? "Blocked: Cryptographic Verification Failed"
+                      : job.status === "running"
+                      ? "Processing"
+                      : "Pending"}
+                  </span>
+                </div>
               </div>
 
-              {/* Finding Detail Drawer (Right Side) */}
-              {selectedRecord && (
+              {/* Blocked Alert */}
+              {job.status === "blocked" && (
                 <div style={{
-                  width: 380,
-                  borderLeft: "1px solid #e5e7eb",
-                  background: "#ffffff",
-                  padding: 16,
-                  display: "flex",
-                  flexDirection: "column",
-                  maxHeight: 560,
-                  overflowY: "auto",
+                  background: "#fef2f2",
+                  border: "1px solid #fee2e2",
+                  borderRadius: "6px",
+                  padding: "12px 16px",
+                  marginBottom: "20px",
+                  color: "#991b1b",
+                  fontSize: "13px",
                 }}>
-                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
-                    <div style={{ fontWeight: 600, fontSize: 13, color: "#111827" }}>
-                      Record #{selectedRecord.record_id}
-                    </div>
-                    <button
-                      onClick={() => setSelectedRecord(null)}
-                      style={{ border: "none", background: "none", fontSize: 16, color: "#6b7280" }}
-                    >
-                      ✕
-                    </button>
-                  </div>
-
-                  {/* Multi-Agent Consensus Banner */}
-                  {selectedRecord.correlated && (
-                    <div style={{
-                      padding: "8px 12px",
-                      background: "#eff6ff",
-                      border: "1px solid #bfdbfe",
-                      borderRadius: 5,
-                      fontSize: 12,
-                      color: "#1e40af",
-                      fontWeight: 600,
-                      marginBottom: 12,
-                    }}>
-                      ⚡ {selectedRecord.correlated.agents_involved.length} Agents Corroborated This Content
-                      <div style={{ fontSize: 11, fontWeight: 400, color: "#3b82f6", marginTop: 2 }}>
-                        Agents: {selectedRecord.correlated.agents_involved.join(", ")}
-                      </div>
-                    </div>
-                  )}
-
-                  {/* Agent Findings Breakdown */}
-                  <div style={{ flex: 1, marginBottom: 16 }}>
-                    <div style={{ fontSize: 11, fontWeight: 600, color: "#6b7280", textTransform: "uppercase", marginBottom: 6 }}>
-                      Active Threat Findings ({selectedRecord.findings?.length || 0})
-                    </div>
-                    {(!selectedRecord.findings || selectedRecord.findings.length === 0) ? (
-                      <div style={{ fontSize: 12, color: "#9ca3af", fontStyle: "italic" }}>
-                        No security flags on this record.
-                      </div>
-                    ) : (
-                      selectedRecord.findings.map((f: any) => (
-                        <div
-                          key={f.finding_id}
-                          style={{
-                            background: "#f9fafb",
-                            border: "1px solid #e5e7eb",
-                            borderRadius: 6,
-                            padding: 10,
-                            marginBottom: 8,
-                            fontSize: 12,
-                          }}
-                        >
-                          <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
-                            <span style={{ fontWeight: 600, color: "#111827", textTransform: "capitalize" }}>
-                              {f.agent} Agent
-                            </span>
-                            <span style={{
-                              fontSize: 10,
-                              fontWeight: 700,
-                              padding: "1px 6px",
-                              borderRadius: 3,
-                              background: f.severity === "HIGH" || f.severity === "CRITICAL" ? "#fee2e2" : "#fef3c7",
-                              color: f.severity === "HIGH" || f.severity === "CRITICAL" ? "#b91c1c" : "#b45309",
-                            }}>
-                              {f.severity}
-                            </span>
-                          </div>
-                          <div style={{ color: "#374151", marginBottom: 4 }}>
-                            <strong>Category:</strong> {f.category}
-                          </div>
-                          <div style={{ color: "#4b5563", fontSize: 11, marginBottom: 4 }}>
-                            <strong>Reason:</strong> {f.reason}
-                          </div>
-                          {f.evidence && (
-                            <div style={{ background: "#ffffff", border: "1px solid #e5e7eb", padding: 6, borderRadius: 4, fontFamily: "monospace", fontSize: 11, color: "#b91c1c" }}>
-                              "{f.evidence}"
-                            </div>
-                          )}
-                        </div>
-                      ))
-                    )}
-                  </div>
-
-                  {/* Inline Cell Edit Form */}
-                  <div style={{ borderTop: "1px solid #e5e7eb", paddingTop: 12, marginBottom: 12 }}>
-                    <div style={{ fontSize: 11, fontWeight: 600, color: "#6b7280", textTransform: "uppercase", marginBottom: 6 }}>
-                      Remediate Record Fields
-                    </div>
-                    {contentData.columns.slice(0, 3).map((col: string) => {
-                      const curVal = editedCells[selectedRecord.record_id]?.[col] !== undefined
-                        ? editedCells[selectedRecord.record_id][col]
-                        : selectedRecord.data[col] || "";
-                      return (
-                        <div key={col} style={{ marginBottom: 6 }}>
-                          <label style={{ display: "block", fontSize: 10, color: "#4b5563" }}>{col}:</label>
-                          <input
-                            type="text"
-                            value={curVal}
-                            onChange={(e) => handleCellEdit(selectedRecord.record_id, col, e.target.value)}
-                            style={{
-                              width: "100%",
-                              padding: "5px 8px",
-                              border: "1px solid #d1d5db",
-                              borderRadius: 4,
-                              fontSize: 12,
-                            }}
-                          />
-                        </div>
-                      );
-                    })}
-                  </div>
-
-                  {/* Remediation Action Controls */}
-                  <div style={{ display: "flex", gap: 8 }}>
-                    <button
-                      onClick={() => toggleRowRemoval(selectedRecord.record_id)}
-                      style={{
-                        flex: 1,
-                        background: removedRecordIds.includes(selectedRecord.record_id) ? "#4b5563" : "#fee2e2",
-                        color: removedRecordIds.includes(selectedRecord.record_id) ? "#ffffff" : "#b91c1c",
-                        border: "1px solid #fca5a5",
-                        padding: "7px 10px",
-                        borderRadius: 5,
-                        fontSize: 11,
-                        fontWeight: 600,
-                      }}
-                    >
-                      {removedRecordIds.includes(selectedRecord.record_id) ? "Undo Removal" : "Remove Record"}
-                    </button>
-                  </div>
+                  <strong>Access Blocked:</strong> {job.blockedReason}
                 </div>
               )}
-            </div>
-          )}
 
-          {/* Audit Trail Tab */}
-          {activeTab === "audit" && (
-            <div style={{ padding: 20 }}>
-              <div style={{ fontSize: 13, fontWeight: 600, color: "#374151", marginBottom: 12 }}>
-                Cryptographic & Governance Event Log
-              </div>
-              {auditEvents.length === 0 ? (
-                <div style={{ fontSize: 13, color: "#9ca3af", fontStyle: "italic" }}>
-                  No audit events recorded yet.
-                </div>
-              ) : (
-                <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-                  {auditEvents.map((evt) => (
-                    <div
-                      key={evt.id}
-                      style={{
-                        padding: "10px 14px",
-                        borderRadius: 6,
-                        background: "#f9fafb",
-                        border: "1px solid #e5e7eb",
-                        fontSize: 12,
+              {/* 9 Vertical Progress Bars in Order */}
+              <div style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
+                {job.steps.map((step) => {
+                  const isRunningStep = step.status === "running";
+                  const isCompletedStep = step.status === "completed";
+                  const isFailedStep = step.status === "failed";
+
+                  return (
+                    <div key={step.id}>
+                      <div style={{
                         display: "flex",
                         justifyContent: "space-between",
                         alignItems: "center",
-                      }}
-                    >
-                      <div>
-                        <span style={{ fontWeight: 600, color: "#111827", marginRight: 8 }}>
-                          {evt.event_type}
+                        marginBottom: "4px",
+                        fontSize: "12px",
+                      }}>
+                        <span style={{ fontWeight: 600, color: "#374151" }}>
+                          {step.label}
                         </span>
-                        <span style={{ color: "#6b7280" }}>
-                          v{evt.version}
+                        <span style={{
+                          color: isCompletedStep
+                            ? "#059669"
+                            : isFailedStep
+                            ? "#dc2626"
+                            : isRunningStep
+                            ? "#2563eb"
+                            : "#9ca3af",
+                          fontWeight: 500,
+                        }}>
+                          {isCompletedStep
+                            ? "Complete"
+                            : isFailedStep
+                            ? "Failed"
+                            : isRunningStep
+                            ? "Running"
+                            : "Waiting"}
                         </span>
                       </div>
-                      <div style={{ color: "#9ca3af", fontSize: 11 }}>
-                        {evt.timestamp}
+
+                      {/* Progress Track */}
+                      <div style={{
+                        height: "7px",
+                        width: "100%",
+                        background: "#f3f4f6",
+                        borderRadius: "4px",
+                        overflow: "hidden",
+                      }}>
+                        <div
+                          className={isRunningStep ? "running-progress" : ""}
+                          style={{
+                            height: "100%",
+                            width: isCompletedStep || isFailedStep ? "100%" : isRunningStep ? "70%" : "0%",
+                            background: isCompletedStep
+                              ? "#10b981"
+                              : isFailedStep
+                              ? "#ef4444"
+                              : isRunningStep
+                              ? "#3b82f6"
+                              : "transparent",
+                            transition: "width 0.4s ease",
+                            borderRadius: "4px",
+                          }}
+                        />
                       </div>
                     </div>
-                  ))}
+                  );
+                })}
+              </div>
+
+              {/* Results summary when completed */}
+              {job.status === "completed" && (
+                <div style={{
+                  marginTop: "18px",
+                  paddingTop: "14px",
+                  borderTop: "1px solid #f3f4f6",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  fontSize: "12px",
+                  color: "#4b5563",
+                }}>
+                  <div>
+                    Risk Score: <strong style={{ color: (job.riskScore ?? 0) >= 65 ? "#dc2626" : (job.riskScore ?? 0) >= 20 ? "#ea580c" : "#16a34a" }}>{job.riskScore ?? 0}/100</strong> ({job.riskLevel}) &bull; Findings: <strong>{job.findingsCount ?? 0}</strong>
+                  </div>
+                  <div>
+                    OPA Policy: <strong style={{ color: job.decision === "APPROVE" ? "#059669" : job.decision === "REJECT" ? "#dc2626" : "#ea580c" }}>{job.decision}</strong>
+                  </div>
                 </div>
               )}
             </div>
-          )}
+          ))}
+        </div>
+      )}
 
-          {/* HITL Submission Bar */}
+      {/* ============================================================ */}
+      {/* HUMAN IN THE LOOP (HITL) REVIEW SECTION                     */}
+      {/* ============================================================ */}
+      <div style={{
+        marginTop: "48px",
+        paddingTop: "36px",
+        borderTop: "2px solid #e5e7eb",
+      }}>
+        <div style={{ marginBottom: "24px", display: "flex", justifyContent: "space-between", alignItems: "flex-end" }}>
+          <div>
+            <h2 style={{ fontSize: "22px", fontWeight: 700, color: "#111827", marginBottom: "4px" }}>
+              Human in the Loop Review
+            </h2>
+            <p style={{ fontSize: "13px", color: "#6b7280" }}>
+              Review ingested datasets in Last-In First-Out order. Filter detections by agent, accept or reject datasets, sanitize poisoned records, and re-evaluate.
+            </p>
+          </div>
+
+          <button
+            onClick={loadDatasets}
+            disabled={hitlLoading}
+            style={{
+              background: "#ffffff",
+              border: "1px solid #d1d5db",
+              padding: "7px 14px",
+              borderRadius: "6px",
+              fontSize: "13px",
+              fontWeight: 500,
+              color: "#374151",
+            }}
+          >
+            {hitlLoading ? "Refreshing..." : "Refresh Datasets"}
+          </button>
+        </div>
+
+        {hitlError && (
           <div style={{
-            background: "#f9fafb",
-            borderTop: "1px solid #e5e7eb",
-            padding: "12px 20px",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "space-between",
-            flexWrap: "wrap",
-            gap: 12,
+            padding: "14px 18px",
+            background: "#fef2f2",
+            border: "1px solid #fee2e2",
+            borderRadius: "6px",
+            color: "#991b1b",
+            fontSize: "13px",
+            marginBottom: "20px",
           }}>
-            <div style={{ display: "flex", alignItems: "center", gap: 8, flex: 1, minWidth: 260 }}>
-              <input
-                type="text"
-                placeholder="Auditor remediation notes..."
-                value={reviewNotes}
-                onChange={(e) => setReviewNotes(e.target.value)}
-                style={{
-                  width: "100%",
-                  padding: "6px 10px",
-                  border: "1px solid #d1d5db",
-                  borderRadius: 4,
-                  fontSize: 12,
-                }}
-              />
+            {hitlError}
+          </div>
+        )}
+
+        {/* Datasets Stack (One after another in LIFO order) */}
+        {datasets.length === 0 && !hitlLoading ? (
+          <div style={{
+            padding: "48px 24px",
+            textAlign: "center",
+            border: "1px dashed #d1d5db",
+            borderRadius: "8px",
+            background: "#ffffff",
+          }}>
+            <div style={{ fontSize: "14px", fontWeight: 600, color: "#374151", marginBottom: "4px" }}>
+              No datasets available in gateway ledger
             </div>
-            <div style={{ display: "flex", gap: 8 }}>
-              {(Object.keys(editedCells).length > 0 || removedRecordIds.length > 0) ? (
-                <button
-                  onClick={() => submitReviewAction("MODIFY")}
-                  disabled={reviewSubmitting}
+            <div style={{ fontSize: "12px", color: "#6b7280" }}>
+              Upload and execute a dataset through the pipeline above to begin security review.
+            </div>
+          </div>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: "24px" }}>
+            {datasets.map((ds) => {
+              const isExpanded = !!expandedDatasets[ds.dataset_id];
+              const activeAgents = agentFilters[ds.dataset_id] || [...ALL_AGENTS];
+              const cacheKey = `${ds.dataset_id}_v${ds.version}`;
+              const content = contentCache[cacheKey];
+              const findings = findingsCache[cacheKey]?.findings || [];
+              const isBusy = !!submittingAction[ds.dataset_id];
+              const notice = actionNotice[ds.dataset_id];
+              const dsModCount = Object.keys(modifiedRecords[ds.dataset_id] || {}).length;
+              const dsRemCount = (removedRecords[ds.dataset_id] || []).length;
+
+              return (
+                <div
+                  key={`${ds.dataset_id}-v${ds.version}`}
                   style={{
-                    background: "#2563eb",
-                    color: "#ffffff",
-                    border: "none",
-                    padding: "7px 14px",
-                    borderRadius: 4,
-                    fontSize: 12,
-                    fontWeight: 600,
+                    background: "#ffffff",
+                    border: "1px solid #e5e7eb",
+                    borderRadius: "10px",
+                    overflow: "hidden",
+                    boxShadow: "0 1px 3px rgba(0, 0, 0, 0.03)",
                   }}
                 >
-                  {reviewSubmitting ? "Generating Version N+1..." : `Apply Edits & Create v${version + 1}`}
-                </button>
-              ) : (
-                <>
-                  <button
-                    onClick={() => submitReviewAction("APPROVE")}
-                    disabled={reviewSubmitting}
-                    style={{
-                      background: "#15803d",
-                      color: "#ffffff",
-                      border: "none",
-                      padding: "7px 14px",
-                      borderRadius: 4,
-                      fontSize: 12,
-                      fontWeight: 600,
-                    }}
-                  >
-                    Approve Dataset
-                  </button>
-                  <button
-                    onClick={() => submitReviewAction("REJECT")}
-                    disabled={reviewSubmitting}
-                    style={{
-                      background: "#dc2626",
-                      color: "#ffffff",
-                      border: "none",
-                      padding: "7px 14px",
-                      borderRadius: 4,
-                      fontSize: 12,
-                      fontWeight: 600,
-                    }}
-                  >
-                    Reject Dataset
-                  </button>
-                </>
-              )}
+                  {/* Dataset Summary & Metadata Card Header */}
+                  <div style={{
+                    padding: "20px 24px",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    flexWrap: "wrap",
+                    gap: "16px",
+                    background: isExpanded ? "#fcfcfd" : "#ffffff",
+                    borderBottom: isExpanded ? "1px solid #e5e7eb" : "none",
+                  }}>
+                    {/* Left details */}
+                    <div style={{ display: "flex", alignItems: "center", gap: "20px", flexWrap: "wrap" }}>
+                      <div>
+                        <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "4px" }}>
+                          <span style={{ fontSize: "16px", fontWeight: 700, color: "#111827" }}>
+                            {ds.filename}
+                          </span>
+                          <span style={{
+                            fontSize: "11px",
+                            fontWeight: 700,
+                            padding: "2px 6px",
+                            borderRadius: "4px",
+                            background: "#f3f4f6",
+                            color: "#374151",
+                          }}>
+                            v{ds.version}
+                          </span>
+                          <span style={{
+                            fontSize: "11px",
+                            fontWeight: 600,
+                            padding: "2px 6px",
+                            borderRadius: "4px",
+                            background: "#eff6ff",
+                            color: "#1e40af",
+                            textTransform: "uppercase",
+                          }}>
+                            {ds.file_type || "CSV"}
+                          </span>
+                        </div>
+                        <div style={{ fontSize: "12px", color: "#6b7280", fontFamily: "monospace" }}>
+                          ID: {ds.dataset_id} &bull; Size: {formatBytes(ds.file_size)} &bull; Records: {ds.record_count ?? "—"}
+                        </div>
+                      </div>
+
+                      {/* Detection results tags */}
+                      <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
+                        <div style={{
+                          padding: "6px 12px",
+                          borderRadius: "6px",
+                          background: (ds.risk_score ?? 0) >= 65 ? "#fef2f2" : (ds.risk_score ?? 0) >= 20 ? "#fffbeb" : "#ecfdf5",
+                          border: `1px solid ${(ds.risk_score ?? 0) >= 65 ? "#fecaca" : (ds.risk_score ?? 0) >= 20 ? "#fde68a" : "#a7f3d0"}`,
+                          fontSize: "12px",
+                        }}>
+                          <span style={{ color: "#6b7280", marginRight: "4px" }}>Risk Score:</span>
+                          <strong style={{ color: (ds.risk_score ?? 0) >= 65 ? "#dc2626" : (ds.risk_score ?? 0) >= 20 ? "#d97706" : "#059669" }}>
+                            {ds.risk_score ?? 0}/100
+                          </strong>
+                          <span style={{ color: "#6b7280", marginLeft: "4px" }}>({ds.risk_level || "LOW"})</span>
+                        </div>
+
+                        <div style={{
+                          padding: "6px 12px",
+                          borderRadius: "6px",
+                          background: ds.opa_decision === "APPROVE" ? "#ecfdf5" : ds.opa_decision === "REJECT" ? "#fef2f2" : "#fffbeb",
+                          border: `1px solid ${ds.opa_decision === "APPROVE" ? "#a7f3d0" : ds.opa_decision === "REJECT" ? "#fecaca" : "#fde68a"}`,
+                          fontSize: "12px",
+                        }}>
+                          <span style={{ color: "#6b7280", marginRight: "4px" }}>Policy:</span>
+                          <strong style={{ color: ds.opa_decision === "APPROVE" ? "#059669" : ds.opa_decision === "REJECT" ? "#dc2626" : "#d97706" }}>
+                            {ds.opa_decision || ds.status}
+                          </strong>
+                        </div>
+
+                        <div style={{ fontSize: "12px", color: "#6b7280" }}>
+                          Findings: <strong style={{ color: "#111827" }}>{ds.findings_count}</strong>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Right Action buttons: Accept / Reject for ALL datasets */}
+                    <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                      <button
+                        onClick={() => submitDecision(ds.dataset_id, ds.version, "APPROVE")}
+                        disabled={isBusy}
+                        style={{
+                          background: "#059669",
+                          color: "#ffffff",
+                          border: "none",
+                          padding: "7px 14px",
+                          borderRadius: "6px",
+                          fontSize: "13px",
+                          fontWeight: 500,
+                        }}
+                      >
+                        Approve
+                      </button>
+
+                      <button
+                        onClick={() => submitDecision(ds.dataset_id, ds.version, "REJECT")}
+                        disabled={isBusy}
+                        style={{
+                          background: "#dc2626",
+                          color: "#ffffff",
+                          border: "none",
+                          padding: "7px 14px",
+                          borderRadius: "6px",
+                          fontSize: "13px",
+                          fontWeight: 500,
+                        }}
+                      >
+                        Reject
+                      </button>
+
+                      <button
+                        onClick={() => toggleExpandDataset(ds)}
+                        style={{
+                          background: isExpanded ? "#111827" : "#ffffff",
+                          color: isExpanded ? "#ffffff" : "#374151",
+                          border: "1px solid #d1d5db",
+                          padding: "7px 14px",
+                          borderRadius: "6px",
+                          fontSize: "13px",
+                          fontWeight: 500,
+                        }}
+                      >
+                        {isExpanded ? "Collapse Viewer" : "Inspect Records"}
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Feedback Notice */}
+                  {notice && (
+                    <div style={{
+                      padding: "10px 24px",
+                      background: notice.type === "success" ? "#ecfdf5" : "#fef2f2",
+                      borderBottom: "1px solid #e5e7eb",
+                      fontSize: "12px",
+                      color: notice.type === "success" ? "#065f46" : "#991b1b",
+                      display: "flex",
+                      justifyContent: "space-between",
+                      alignItems: "center",
+                    }}>
+                      <span>{notice.text}</span>
+                      <button
+                        onClick={() => setActionNotice((prev) => ({ ...prev, [ds.dataset_id]: null as any }))}
+                        style={{ background: "none", border: "none", color: "#6b7280", fontSize: "12px" }}
+                      >
+                        Dismiss
+                      </button>
+                    </div>
+                  )}
+
+                  {/* Expandable Dataset Records Viewer & Agent Flag Filters */}
+                  {isExpanded && (
+                    <div style={{ padding: "24px" }}>
+                      {/* Controls Bar: Multi-Select Agent Flag Filter */}
+                      <div style={{
+                        background: "#f9fafb",
+                        border: "1px solid #e5e7eb",
+                        borderRadius: "8px",
+                        padding: "14px 18px",
+                        marginBottom: "20px",
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "space-between",
+                        flexWrap: "wrap",
+                        gap: "12px",
+                      }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap" }}>
+                          <span style={{ fontSize: "12px", fontWeight: 700, color: "#374151", textTransform: "uppercase", letterSpacing: "0.03em" }}>
+                            Filter Agent Flags:
+                          </span>
+
+                          {ALL_AGENTS.map((agent) => {
+                            const isSelected = activeAgents.includes(agent);
+                            const badge = getAgentBadgeColor(agent);
+
+                            return (
+                              <button
+                                key={agent}
+                                onClick={() => toggleAgentFilter(ds.dataset_id, agent)}
+                                style={{
+                                  padding: "4px 10px",
+                                  borderRadius: "6px",
+                                  fontSize: "12px",
+                                  fontWeight: 600,
+                                  cursor: "pointer",
+                                  border: isSelected ? `1px solid ${badge.border}` : "1px solid #d1d5db",
+                                  background: isSelected ? badge.bg : "#ffffff",
+                                  color: isSelected ? badge.text : "#6b7280",
+                                  display: "inline-flex",
+                                  alignItems: "center",
+                                  gap: "6px",
+                                  transition: "all 0.15s ease",
+                                }}
+                              >
+                                <span style={{
+                                  width: 7,
+                                  height: 7,
+                                  borderRadius: "50%",
+                                  background: isSelected ? badge.dot : "#d1d5db",
+                                }} />
+                                <span style={{ textTransform: "capitalize" }}>{agent}</span>
+                              </button>
+                            );
+                          })}
+
+                          <div style={{ display: "flex", gap: "6px", marginLeft: "6px" }}>
+                            <button
+                              onClick={() => selectAllAgents(ds.dataset_id)}
+                              style={{ background: "none", border: "none", fontSize: "11px", color: "#2563eb", textDecoration: "underline" }}
+                            >
+                              Select All
+                            </button>
+                            <span style={{ color: "#d1d5db", fontSize: "11px" }}>|</span>
+                            <button
+                              onClick={() => clearAllAgents(ds.dataset_id)}
+                              style={{ background: "none", border: "none", fontSize: "11px", color: "#6b7280", textDecoration: "underline" }}
+                            >
+                              Clear All
+                            </button>
+                          </div>
+                        </div>
+
+                        {/* Staged Modifications & Rerun Button */}
+                        {(dsModCount > 0 || dsRemCount > 0) && (
+                          <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                            <span style={{ fontSize: "12px", color: "#b45309", fontWeight: 500 }}>
+                              Staged: {dsModCount} cell edit(s), {dsRemCount} removal(s)
+                            </span>
+                            <button
+                              onClick={() => submitRemediation(ds.dataset_id, ds.version)}
+                              disabled={isBusy}
+                              style={{
+                                background: "#2563eb",
+                                color: "#ffffff",
+                                border: "none",
+                                padding: "6px 14px",
+                                borderRadius: "6px",
+                                fontSize: "12px",
+                                fontWeight: 600,
+                              }}
+                            >
+                              {isBusy ? "Processing v" + (ds.version + 1) + "..." : "Apply Changes & Rerun Pipeline"}
+                            </button>
+                          </div>
+                        )}
+                      </div>
+
+                      {/* Main Data Table & Threat Details Panel */}
+                      <div style={{ display: "flex", gap: "20px", alignItems: "flex-start" }}>
+                        {/* Table */}
+                        <div style={{
+                          flex: 1,
+                          minWidth: 0,
+                          border: "1px solid #e5e7eb",
+                          borderRadius: "8px",
+                          overflow: "hidden",
+                          background: "#ffffff",
+                        }}>
+                          {loadingContent[ds.dataset_id] ? (
+                            <div style={{ padding: "32px", textAlign: "center", color: "#6b7280", fontSize: "13px" }}>
+                              Loading dataset records...
+                            </div>
+                          ) : !content?.records?.length ? (
+                            <div style={{ padding: "32px", textAlign: "center", color: "#6b7280", fontSize: "13px" }}>
+                              No records found for this dataset version.
+                            </div>
+                          ) : (
+                            <div style={{ overflowX: "auto", maxHeight: "550px" }}>
+                              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "13px" }}>
+                                <thead>
+                                  <tr style={{ background: "#f9fafb", borderBottom: "1px solid #e5e7eb", textAlign: "left" }}>
+                                    <th style={{ padding: "10px 14px", width: "60px", color: "#6b7280" }}>Row</th>
+                                    {content.columns.map((col: string) => (
+                                      <th key={col} style={{ padding: "10px 14px", color: "#374151", fontWeight: 600 }}>{col}</th>
+                                    ))}
+                                    <th style={{ padding: "10px 14px", width: "80px", textAlign: "right" }}>Actions</th>
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  {content.records.map((rec: any) => {
+                                    const rId = String(rec.record_id);
+                                    const isRowRemoved = (removedRecords[ds.dataset_id] || []).includes(rId);
+
+                                    return (
+                                      <tr
+                                        key={rId}
+                                        style={{
+                                          borderBottom: "1px solid #f3f4f6",
+                                          background: isRowRemoved ? "#fef2f2" : "#ffffff",
+                                          opacity: isRowRemoved ? 0.45 : 1,
+                                        }}
+                                      >
+                                        <td style={{ padding: "10px 14px", color: "#9ca3af", fontFamily: "monospace", fontSize: "12px" }}>
+                                          #{rec.location?.line_number || rec.location?.row || rId}
+                                        </td>
+
+                                        {content.columns.map((col: string) => {
+                                          const originalVal = rec.data[col] !== undefined ? String(rec.data[col]) : "";
+                                          const editedVal = modifiedRecords[ds.dataset_id]?.[rId]?.[col];
+                                          const displayVal = editedVal !== undefined ? editedVal : originalVal;
+                                          const finding = getCellFinding(findings, rec, col, activeAgents);
+                                          const badge = finding ? getAgentBadgeColor(finding.agent) : null;
+
+                                          return (
+                                            <td
+                                              key={col}
+                                              onClick={() => {
+                                                if (finding) setSelectedFinding(finding);
+                                              }}
+                                              style={{
+                                                padding: "8px 12px",
+                                                maxWidth: "380px",
+                                                wordBreak: "break-word",
+                                                cursor: finding ? "pointer" : "default",
+                                                background: badge ? badge.bg : editedVal !== undefined ? "#f0fdf4" : "transparent",
+                                                color: badge ? badge.text : "#111827",
+                                                borderLeft: badge ? `3px solid ${badge.border}` : "none",
+                                              }}
+                                            >
+                                              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "8px" }}>
+                                                <span>{displayVal}</span>
+                                                <button
+                                                  onClick={(e) => {
+                                                    e.stopPropagation();
+                                                    setEditModalInfo({
+                                                      datasetId: ds.dataset_id,
+                                                      version: ds.version,
+                                                      recordId: rId,
+                                                      field: col,
+                                                      value: displayVal,
+                                                    });
+                                                  }}
+                                                  style={{
+                                                    border: "1px solid #d1d5db",
+                                                    background: "#ffffff",
+                                                    color: "#4b5563",
+                                                    padding: "2px 6px",
+                                                    borderRadius: "4px",
+                                                    fontSize: "11px",
+                                                    cursor: "pointer",
+                                                  }}
+                                                >
+                                                  Edit
+                                                </button>
+                                              </div>
+                                            </td>
+                                          );
+                                        })}
+
+                                        <td style={{ padding: "10px 14px", textAlign: "right" }}>
+                                          <button
+                                            onClick={() => toggleRowRemoval(ds.dataset_id, rId)}
+                                            style={{
+                                              border: isRowRemoved ? "1px solid #111827" : "1px solid #ef4444",
+                                              background: isRowRemoved ? "#111827" : "#ffffff",
+                                              color: isRowRemoved ? "#ffffff" : "#dc2626",
+                                              padding: "3px 8px",
+                                              borderRadius: "4px",
+                                              fontSize: "11px",
+                                            }}
+                                          >
+                                            {isRowRemoved ? "Undo" : "Remove"}
+                                          </button>
+                                        </td>
+                                      </tr>
+                                    );
+                                  })}
+                                </tbody>
+                              </table>
+                            </div>
+                          )}
+                        </div>
+
+                        {/* Threat Details Drawer */}
+                        {selectedFinding && (
+                          <div style={{
+                            width: "350px",
+                            background: "#ffffff",
+                            border: "1px solid #e5e7eb",
+                            borderRadius: "8px",
+                            padding: "18px",
+                            position: "sticky",
+                            top: "24px",
+                          }}>
+                            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "14px" }}>
+                              <div style={{ fontSize: "14px", fontWeight: 700, color: "#111827" }}>
+                                Threat Details
+                              </div>
+                              <button
+                                onClick={() => setSelectedFinding(null)}
+                                style={{ background: "none", border: "none", fontSize: "14px", color: "#9ca3af" }}
+                              >
+                                x
+                              </button>
+                            </div>
+
+                            <div style={{ display: "flex", flexDirection: "column", gap: "12px", fontSize: "13px" }}>
+                              <div>
+                                <span style={{ fontSize: "11px", color: "#6b7280", fontWeight: 600 }}>AGENT</span>
+                                <div style={{ textTransform: "uppercase", fontWeight: 700, color: getAgentBadgeColor(selectedFinding.agent).text }}>
+                                  {selectedFinding.agent} Threat Intelligence
+                                </div>
+                              </div>
+
+                              <div>
+                                <span style={{ fontSize: "11px", color: "#6b7280", fontWeight: 600 }}>CATEGORY & SEVERITY</span>
+                                <div style={{ fontWeight: 600, color: "#111827" }}>
+                                  {selectedFinding.category} ({selectedFinding.severity})
+                                </div>
+                              </div>
+
+                              <div>
+                                <span style={{ fontSize: "11px", color: "#6b7280", fontWeight: 600 }}>EVIDENCE EXCERPT</span>
+                                <div style={{
+                                  background: "#f9fafb",
+                                  padding: "8px",
+                                  borderRadius: "5px",
+                                  border: "1px solid #e5e7eb",
+                                  fontFamily: "monospace",
+                                  fontSize: "12px",
+                                  color: "#1f2937",
+                                  maxHeight: "120px",
+                                  overflowY: "auto",
+                                }}>
+                                  {selectedFinding.evidence}
+                                </div>
+                              </div>
+
+                              <div>
+                                <span style={{ fontSize: "11px", color: "#6b7280", fontWeight: 600 }}>SECURITY JUSTIFICATION</span>
+                                <div style={{ color: "#4b5563" }}>
+                                  {selectedFinding.reason}
+                                </div>
+                              </div>
+
+                              <div>
+                                <span style={{ fontSize: "11px", color: "#6b7280", fontWeight: 600 }}>ANALYZER</span>
+                                <div style={{ color: "#4b5563", fontSize: "12px" }}>
+                                  {selectedFinding.model_or_provider || "Adversarial Threat Intelligence Engine"}
+                                </div>
+                              </div>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
+      {/* Inline Cell Edit Modal */}
+      {editModalInfo && (
+        <div style={{
+          position: "fixed",
+          top: 0,
+          left: 0,
+          right: 0,
+          bottom: 0,
+          background: "rgba(0, 0, 0, 0.4)",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          zIndex: 1000,
+        }}>
+          <div style={{
+            background: "#ffffff",
+            borderRadius: "8px",
+            width: "520px",
+            maxWidth: "90%",
+            padding: "24px",
+            boxShadow: "0 20px 25px -5px rgba(0, 0, 0, 0.1)",
+          }}>
+            <h3 style={{ fontSize: "16px", fontWeight: 700, color: "#111827", marginBottom: "6px" }}>
+              Edit Field: {editModalInfo.field}
+            </h3>
+            <p style={{ fontSize: "12px", color: "#6b7280", marginBottom: "16px" }}>
+              Modifying this value will stage an edit. Applying changes will generate Version {editModalInfo.version + 1} and re-evaluate through the pipeline.
+            </p>
+
+            <textarea
+              value={editModalInfo.value}
+              onChange={(e) =>
+                setEditModalInfo((prev) => (prev ? { ...prev, value: e.target.value } : null))
+              }
+              rows={5}
+              style={{
+                width: "100%",
+                padding: "10px",
+                borderRadius: "6px",
+                border: "1px solid #d1d5db",
+                fontSize: "13px",
+                fontFamily: "inherit",
+                color: "#111827",
+                marginBottom: "20px",
+              }}
+            />
+
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: "10px" }}>
+              <button
+                onClick={() => setEditModalInfo(null)}
+                style={{
+                  background: "#f3f4f6",
+                  color: "#374151",
+                  border: "none",
+                  padding: "8px 14px",
+                  borderRadius: "6px",
+                  fontSize: "13px",
+                }}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={saveCellEdit}
+                style={{
+                  background: "#111827",
+                  color: "#ffffff",
+                  border: "none",
+                  padding: "8px 16px",
+                  borderRadius: "6px",
+                  fontSize: "13px",
+                  fontWeight: 500,
+                }}
+              >
+                Save Cell Edit
+              </button>
             </div>
           </div>
         </div>

@@ -6,53 +6,52 @@ default decision := "REJECT"
 
 default reasons := ["Default security policy triggered: rejection required."]
 
-# Rule 1: Immediate REJECT if cryptographic verification failed
+# Rule 1: Immediate REJECT if cryptographic verification failed or risk score >= 65
 decision := "REJECT" if {
     not input.cryptographic_verified
+}
+
+decision := "REJECT" if {
+    input.risk_score >= 65
 }
 
 reasons := ["Cryptographic integrity check failed. Stored SHA-256 or ML-DSA-65 signature is invalid."] if {
     not input.cryptographic_verified
 }
 
-# Rule 2: QUARANTINE if critical or high risk score, or high severity findings present
-decision := "QUARANTINE" if {
+reasons := [sprintf("High risk score (%v/100) exceeds safety threshold. Dataset rejected from model training.", [input.risk_score])] if {
     input.cryptographic_verified
-    input.risk_score >= 50
+    input.risk_score >= 65
 }
 
+# Rule 2: QUARANTINE if moderate risk score (20 to 64) or human review required
 decision := "QUARANTINE" if {
     input.cryptographic_verified
-    input.high_severity_findings > 0
+    input.risk_score >= 20
+    input.risk_score < 65
 }
 
 decision := "QUARANTINE" if {
     input.cryptographic_verified
     input.human_review_required == true
+    input.risk_score < 65
 }
 
-reasons := [sprintf("High risk score (%v/100) requires isolation in quarantine for human remediation.", [input.risk_score])] if {
+reasons := [sprintf("Moderate risk score (%v/100) requires isolation in quarantine for human remediation.", [input.risk_score])] if {
     input.cryptographic_verified
-    input.risk_score >= 50
+    input.risk_score >= 20
+    input.risk_score < 65
 }
 
-reasons := [sprintf("Detected %v high-severity adversarial findings requiring human-in-the-loop review.", [input.high_severity_findings])] if {
-    input.cryptographic_verified
-    input.high_severity_findings > 0
-    input.risk_score < 50
-}
-
-# Rule 3: APPROVE if cryptographically verified and no high severity findings and risk is acceptable
+# Rule 3: APPROVE if cryptographically verified and risk score < 20 and no pending review
 decision := "APPROVE" if {
     input.cryptographic_verified
-    input.risk_score < 50
-    input.high_severity_findings == 0
+    input.risk_score < 20
     not input.human_review_required
 }
 
 reasons := ["Dataset passed post-quantum cryptographic verification and meets enterprise safety risk thresholds."] if {
     input.cryptographic_verified
-    input.risk_score < 50
-    input.high_severity_findings == 0
+    input.risk_score < 20
     not input.human_review_required
 }
