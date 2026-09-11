@@ -59,13 +59,10 @@ export default function TrainingDatasetsPage() {
 
   return (
     <div style={{ padding: "40px 48px", maxWidth: "1200px", margin: "0 auto" }}>
-      <div style={{ marginBottom: "32px" }}>
-        <h1 style={{ fontSize: "24px", fontWeight: 700, color: "#111827", marginBottom: "6px" }}>
+      <div style={{ marginBottom: "28px" }}>
+        <h1 style={{ fontSize: "24px", fontWeight: 700, color: "#111827" }}>
           Training Datasets
         </h1>
-        <p style={{ fontSize: "14px", color: "#6b7280" }}>
-          Cryptographically verified, evaluated, and approved datasets authorized for model training.
-        </p>
       </div>
 
       {loading && (

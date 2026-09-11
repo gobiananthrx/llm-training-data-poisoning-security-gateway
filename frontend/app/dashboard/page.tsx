@@ -135,12 +135,9 @@ export default function DashboardPage() {
       {/* Header */}
       <div style={{ marginBottom: "32px", display: "flex", justifyContent: "space-between", alignItems: "flex-end" }}>
         <div>
-          <h1 style={{ fontSize: "26px", fontWeight: 700, color: "#111827", letterSpacing: "-0.02em", marginBottom: "6px" }}>
+          <h1 style={{ fontSize: "26px", fontWeight: 700, color: "#111827", letterSpacing: "-0.02em" }}>
             Security Dashboard
           </h1>
-          <p style={{ fontSize: "14px", color: "#6b7280" }}>
-            Real-time telemetry on cryptographic integrity, adversarial threat detections, and policy decisions.
-          </p>
         </div>
 
         <button
@@ -222,12 +219,9 @@ export default function DashboardPage() {
           padding: "24px",
           boxShadow: "0 1px 3px rgba(0, 0, 0, 0.04)",
         }}>
-          <h2 style={{ fontSize: "15px", fontWeight: 700, color: "#111827", marginBottom: "4px" }}>
+          <h2 style={{ fontSize: "15px", fontWeight: 700, color: "#111827", marginBottom: "16px" }}>
             Dataset Governance Distribution
           </h2>
-          <p style={{ fontSize: "12px", color: "#6b7280", marginBottom: "20px" }}>
-            Cumulative proportion of all processed datasets across gateway states
-          </p>
 
           {/* Horizontal multi-segment track */}
           <div style={{
@@ -285,12 +279,9 @@ export default function DashboardPage() {
           padding: "24px",
           boxShadow: "0 1px 3px rgba(0, 0, 0, 0.04)",
         }}>
-          <h2 style={{ fontSize: "15px", fontWeight: 700, color: "#111827", marginBottom: "4px" }}>
+          <h2 style={{ fontSize: "15px", fontWeight: 700, color: "#111827", marginBottom: "16px" }}>
             Category Volume Comparison
           </h2>
-          <p style={{ fontSize: "12px", color: "#6b7280", marginBottom: "20px" }}>
-            Direct volumetric count across security and governance classifications
-          </p>
 
           <div style={{ display: "flex", alignItems: "flex-end", height: "140px", gap: "28px", paddingBottom: "10px", borderBottom: "1px solid #f3f4f6" }}>
             {barSegments.map((seg) => {
@@ -338,9 +329,6 @@ export default function DashboardPage() {
             <h3 style={{ fontSize: "15px", fontWeight: 700, color: "#111827" }}>
               Dataset Telemetry Ledger
             </h3>
-            <span style={{ fontSize: "12px", color: "#6b7280" }}>
-              Comprehensive log of all registered datasets in the gateway
-            </span>
           </div>
           <a
             href="/"
@@ -399,11 +387,15 @@ export default function DashboardPage() {
                       </span>
                     </td>
                     <td style={{ padding: "12px 18px", fontWeight: 700 }}>
-                      <span style={{
-                        color: (d.risk_score ?? 0) >= 65 ? "#dc2626" : (d.risk_score ?? 0) >= 20 ? "#ea580c" : "#059669",
-                      }}>
-                        {d.risk_score ?? 0}/100
-                      </span>
+                      {d.status === "BLOCKED" || d.status === "UPLOADED" ? (
+                        <span style={{ color: "#9ca3af" }}>-</span>
+                      ) : (
+                        <span style={{
+                          color: (d.risk_score ?? 0) >= 65 ? "#dc2626" : (d.risk_score ?? 0) >= 20 ? "#ea580c" : "#059669",
+                        }}>
+                          {d.risk_score ?? 0}/100
+                        </span>
+                      )}
                     </td>
                     <td style={{ padding: "12px 18px" }}>
                       <span style={{

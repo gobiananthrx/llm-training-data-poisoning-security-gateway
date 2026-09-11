@@ -85,7 +85,9 @@ async def test_inconsistency_agent_detection(tmp_path):
     dataset = normalize_dataset(csv_file, ".csv")
     findings = await run_inconsistency_agent(dataset_id="DS-INC-TEST", version=1, dataset=dataset)
 
-    assert len(findings) >= 1
+    assert len(findings) >= 2
+    rec_ids = {f.record_id for f in findings}
+    assert "0" in rec_ids and "1" in rec_ids
     flagged = findings[0]
     assert flagged.agent == "inconsistency"
     assert flagged.related_record_ids is not None

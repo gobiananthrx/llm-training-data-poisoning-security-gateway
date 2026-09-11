@@ -30,6 +30,7 @@ STOP_WORDS = {
 
 CONFLICT_KEYWORDS = [
     ("refund", ["30 day", "30 business days", "within 30", "14 day"], ["non-refundable", "no refunds", "never issued", "cannot refund"]),
+    ("return", ["5 days", "5 day", "14 days", "14 day", "30 days", "30 day", "days return", "return policy", "eligible for return", "accepts returns"], ["no return", "no returns", "cannot return", "non-returnable", "returns are not accepted", "not eligible for return", "final sale"]),
     ("support hours", ["monday through friday", "9am to 5pm", "business hours"], ["24 hours a day", "24/7", "7 days a week", "around the clock"]),
     ("warranty", ["lifetime", "1 year", "2 year"], ["no warranty", "as-is", "void"]),
     ("policy", ["strictly processed", "guaranteed"], ["never issued", "completely prohibited"]),
@@ -68,7 +69,7 @@ async def run_inconsistency_agent(
 
     # Index records
     records = dataset.records
-    candidate_pairs: list[tuple[str, str, dict[str, Any], dict[str, Any], dict[str, Any], str]] = []
+    candidate_pairs: list[tuple[str, str, dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any], str, bool]] = []
 
     # 2. Pair generation: check exact query match or topical conflict keywords
     for i in range(len(records)):
@@ -88,6 +89,7 @@ async def run_inconsistency_agent(
             # Check overlap or specific conflict pairs
             overlap = tokens_a.intersection(tokens_b)
             is_candidate = False
+            is_strong = False
             detected_reason = ""
 
             # Check known conflict patterns
@@ -99,6 +101,7 @@ async def run_inconsistency_agent(
                     b_has_pos = any(t in text_b for t in positive_terms)
                     if (a_has_pos and b_has_neg) or (a_has_neg and b_has_pos):
                         is_candidate = True
+                        is_strong = True
                         detected_reason = f"Contradictory terms detected regarding '{topic}'."
                         break
 
@@ -108,15 +111,16 @@ async def run_inconsistency_agent(
                 q_b = _clean_str(" ".join(str(rec_b.data.get(f, "")) for f in query_fields))
                 if q_a and q_b and q_a == q_b and text_a != text_b:
                     is_candidate = True
+                    is_strong = True
                     detected_reason = "Identical query receives conflicting answers."
 
-            # Or high token overlap with distinct figures/antonyms
-            if not is_candidate and len(overlap) >= 3:
-                # check if there are conflicting digits or days
+            # Or high token overlap with distinct figures/antonyms (heuristic candidate for LLM)
+            if not is_candidate and len(overlap) >= 4:
                 digits_a = set(re.findall(r"\b\d+\b", text_a))
                 digits_b = set(re.findall(r"\b\d+\b", text_b))
                 if digits_a and digits_b and digits_a != digits_b:
                     is_candidate = True
+                    is_strong = False
                     detected_reason = "Conflicting quantitative figures or timelines detected."
 
             if is_candidate:
@@ -127,11 +131,14 @@ async def run_inconsistency_agent(
                     rec_a.data,
                     rec_b.data,
                     rec_a.location,
+                    rec_b.location,
                     detected_reason,
+                    is_strong,
                 ))
 
     # Evaluate pairs
-    for rec_a_id, rec_b_id, data_a, data_b, loc_a, pair_reason in candidate_pairs[:10]:
+    flagged_record_ids: set[str] = set()
+    for rec_a_id, rec_b_id, data_a, data_b, loc_a, loc_b, pair_reason, is_strong in candidate_pairs[:10]:
         val_a = " ".join(str(v) for v in data_a.values())
         val_b = " ".join(str(v) for v in data_b.values())
 
@@ -154,51 +161,103 @@ async def run_inconsistency_agent(
             system_instruction=system_inst,
         )
 
-        target_field = answer_fields[0] if answer_fields else list(data_a.keys())[0] if data_a else "text"
+        target_field_a = answer_fields[0] if answer_fields else list(data_a.keys())[0] if data_a else "text"
+        target_field_b = answer_fields[0] if answer_fields else list(data_b.keys())[0] if data_b else "text"
 
-        loc = dict(loc_a)
-        loc["field"] = target_field
-        loc_span = {"start": 0, "end": min(len(val_a), 200)}
+        loc_a_dict = dict(loc_a)
+        loc_a_dict["field"] = target_field_a
+        loc_span_a = {"start": 0, "end": min(len(val_a), 200)}
+
+        loc_b_dict = dict(loc_b)
+        loc_b_dict["field"] = target_field_b
+        loc_span_b = {"start": 0, "end": min(len(val_b), 200)}
 
         if llm_result:
             if llm_result.category.upper() != "CONSISTENT":
-                finding = AgentFindingSchema(
+                if rec_a_id not in flagged_record_ids:
+                    finding_a = AgentFindingSchema(
+                        dataset_id=dataset_id,
+                        version=version,
+                        agent="inconsistency",
+                        status=FindingStatus.FLAGGED,
+                        record_id=rec_a_id,
+                        field=target_field_a,
+                        location={**loc_a_dict, "span": llm_result.location_span or loc_span_a},
+                        category=llm_result.category,
+                        severity=FindingSeverity.MEDIUM,
+                        confidence=llm_result.confidence,
+                        evidence=llm_result.evidence or f"Conflict between Record {rec_a_id} and Record {rec_b_id}: '{val_a[:80]}' vs '{val_b[:80]}'",
+                        reason=llm_result.reason,
+                        recommendation=FindingRecommendation.REVIEW,
+                        related_record_ids=[rec_b_id],
+                        model_or_provider=provider,
+                    )
+                    findings.append(finding_a)
+                    flagged_record_ids.add(rec_a_id)
+
+                if rec_b_id not in flagged_record_ids:
+                    finding_b = AgentFindingSchema(
+                        dataset_id=dataset_id,
+                        version=version,
+                        agent="inconsistency",
+                        status=FindingStatus.FLAGGED,
+                        record_id=rec_b_id,
+                        field=target_field_b,
+                        location={**loc_b_dict, "span": loc_span_b},
+                        category=llm_result.category,
+                        severity=FindingSeverity.MEDIUM,
+                        confidence=llm_result.confidence,
+                        evidence=f"Conflict between Record {rec_b_id} and Record {rec_a_id}: '{val_b[:80]}' vs '{val_a[:80]}'",
+                        reason=llm_result.reason,
+                        recommendation=FindingRecommendation.REVIEW,
+                        related_record_ids=[rec_a_id],
+                        model_or_provider=provider,
+                    )
+                    findings.append(finding_b)
+                    flagged_record_ids.add(rec_b_id)
+        elif is_strong:
+            evidence_str_a = f"Record {rec_a_id} states '{val_a[:70]}...' whereas Record {rec_b_id} states '{val_b[:70]}...'"
+            if rec_a_id not in flagged_record_ids:
+                finding_a = AgentFindingSchema(
                     dataset_id=dataset_id,
                     version=version,
                     agent="inconsistency",
                     status=FindingStatus.FLAGGED,
                     record_id=rec_a_id,
-                    field=target_field,
-                    location={**loc, "span": llm_result.location_span or loc_span},
-                    category=llm_result.category,
-                    severity=llm_result.severity,
-                    confidence=llm_result.confidence,
-                    evidence=llm_result.evidence or f"Conflict between Record {rec_a_id} and Record {rec_b_id}: '{val_a[:80]}' vs '{val_b[:80]}'",
-                    reason=llm_result.reason,
+                    field=target_field_a,
+                    location={**loc_a_dict, "span": loc_span_a},
+                    category="CONTRADICTORY_INFORMATION",
+                    severity=FindingSeverity.MEDIUM,
+                    confidence=0.88,
+                    evidence=evidence_str_a,
+                    reason=pair_reason or "Factual contradiction detected between records regarding operational policies.",
                     recommendation=FindingRecommendation.REVIEW,
                     related_record_ids=[rec_b_id],
-                    model_or_provider=provider,
+                    model_or_provider="Adversarial Threat Intelligence Engine",
                 )
-                findings.append(finding)
-        else:
-            evidence_str = f"Record {rec_a_id} states '{val_a[:70]}...' whereas Record {rec_b_id} states '{val_b[:70]}...'"
-            finding = AgentFindingSchema(
-                dataset_id=dataset_id,
-                version=version,
-                agent="inconsistency",
-                status=FindingStatus.FLAGGED,
-                record_id=rec_a_id,
-                field=target_field,
-                location={**loc, "span": loc_span},
-                category="CONTRADICTORY_INFORMATION",
-                severity=FindingSeverity.MEDIUM,
-                confidence=0.88,
-                evidence=evidence_str,
-                reason=pair_reason or "Factual contradiction detected between records regarding operational policies.",
-                recommendation=FindingRecommendation.REVIEW,
-                related_record_ids=[rec_b_id],
-                model_or_provider="Adversarial Threat Intelligence Engine",
-            )
-            findings.append(finding)
+                findings.append(finding_a)
+                flagged_record_ids.add(rec_a_id)
+
+            evidence_str_b = f"Record {rec_b_id} states '{val_b[:70]}...' whereas Record {rec_a_id} states '{val_a[:70]}...'"
+            if rec_b_id not in flagged_record_ids:
+                finding_b = AgentFindingSchema(
+                    dataset_id=dataset_id,
+                    version=version,
+                    agent="inconsistency",
+                    status=FindingStatus.FLAGGED,
+                    record_id=rec_b_id,
+                    field=target_field_b,
+                    location={**loc_b_dict, "span": loc_span_b},
+                    category="CONTRADICTORY_INFORMATION",
+                    severity=FindingSeverity.MEDIUM,
+                    confidence=0.88,
+                    evidence=evidence_str_b,
+                    reason=pair_reason or "Factual contradiction detected between records regarding operational policies.",
+                    recommendation=FindingRecommendation.REVIEW,
+                    related_record_ids=[rec_a_id],
+                    model_or_provider="Adversarial Threat Intelligence Engine",
+                )
+                findings.append(finding_b)
+                flagged_record_ids.add(rec_b_id)
 
     return findings

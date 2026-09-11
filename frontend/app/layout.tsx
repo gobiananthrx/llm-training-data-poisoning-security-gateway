@@ -57,6 +57,17 @@ export default function RootLayout({
             background-size: 30px 30px;
             animation: progress-stripe 1.2s linear infinite;
           }
+          nextjs-portal,
+          [data-nextjs-toast],
+          [data-nextjs-dev-tools],
+          #nextjs-dev-tools,
+          [data-nextjs-dev-indicator],
+          [class*="nextjs-portal"] {
+            display: none !important;
+            opacity: 0 !important;
+            visibility: hidden !important;
+            pointer-events: none !important;
+          }
         `}</style>
       </head>
       <body>
@@ -126,19 +137,6 @@ export default function RootLayout({
                 Training Datasets
               </a>
             </nav>
-
-            <div style={{
-              borderTop: "1px solid #f3f4f6",
-              paddingTop: "16px",
-              display: "flex",
-              alignItems: "center",
-              gap: "8px",
-              fontSize: "12px",
-              color: "#6b7280",
-            }}>
-              <span style={{ width: 7, height: 7, borderRadius: "50%", background: "#10b981", display: "inline-block" }}></span>
-              <span>ML-DSA-65 Active</span>
-            </div>
           </aside>
 
           {/* Main Content View */}

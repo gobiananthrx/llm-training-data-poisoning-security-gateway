@@ -57,6 +57,25 @@ interface DatasetItem {
 
 const ALL_AGENTS = ["semantic", "behavioral", "inconsistency", "pii"];
 
+type HITLFilterType = "ALL" | "QUARANTINED" | "REJECTED" | "APPROVED";
+
+function getDatasetHITLState(d: DatasetItem): "QUARANTINED" | "REJECTED" | "APPROVED" | null {
+  const dec = (d.opa_decision || "").toUpperCase();
+  const stat = (d.status || "").toUpperCase();
+  if (dec === "QUARANTINE" || stat === "QUARANTINED") return "QUARANTINED";
+  if (dec === "REJECT" || stat === "REJECTED") return "REJECTED";
+  if (dec === "APPROVE" || stat === "APPROVED") return "APPROVED";
+  return null;
+}
+
+function formatRiskScore(status: string | null, score: number | null): string {
+  const s = (status || "").toUpperCase();
+  if (s === "BLOCKED" || s === "UPLOADED" || s === "FAILED" || score === null || score === undefined) {
+    return "-";
+  }
+  return `${score}/100`;
+}
+
 export default function PipelineAndHITLPage() {
   // --- Pipeline Upload State ---
   const [jobs, setJobs] = useState<FileJob[]>([]);
@@ -64,6 +83,7 @@ export default function PipelineAndHITLPage() {
 
   // --- HITL State ---
   const [datasets, setDatasets] = useState<DatasetItem[]>([]);
+  const [hitlFilter, setHitlFilter] = useState<HITLFilterType>("ALL");
   const [hitlLoading, setHitlLoading] = useState(false);
   const [hitlError, setHitlError] = useState<string | null>(null);
 
@@ -93,8 +113,8 @@ export default function PipelineAndHITLPage() {
     value: string;
   } | null>(null);
 
-  // Selected Threat Details Drawer
-  const [selectedFinding, setSelectedFinding] = useState<any | null>(null);
+  // Selected Threat Details Drawer (supports multiple findings for a single cell)
+  const [selectedFindings, setSelectedFindings] = useState<any[] | null>(null);
 
   useEffect(() => {
     loadDatasets();
@@ -107,12 +127,29 @@ export default function PipelineAndHITLPage() {
       const res = await fetch(`${API_BASE_URL}/api/datasets/`);
       if (!res.ok) throw new Error("Failed to load datasets");
       const data: DatasetItem[] = await res.json();
-      // Sort LIFO (newest first)
-      const sorted = [...data].sort((a, b) => {
+
+      // Only include approved, rejected, and quarantined datasets
+      const eligible = data.filter((d) => getDatasetHITLState(d) !== null);
+
+      // Priority ordering: Quarantined first, then Rejected, then Approved.
+      // Within each priority group, preserve newest first (LIFO).
+      const priorityWeight: Record<string, number> = {
+        QUARANTINED: 1,
+        REJECTED: 2,
+        APPROVED: 3,
+      };
+
+      const sorted = [...eligible].sort((a, b) => {
+        const stateA = getDatasetHITLState(a) || "APPROVED";
+        const stateB = getDatasetHITLState(b) || "APPROVED";
+        if (priorityWeight[stateA] !== priorityWeight[stateB]) {
+          return priorityWeight[stateA] - priorityWeight[stateB];
+        }
         const timeA = new Date(a.created_at || 0).getTime();
         const timeB = new Date(b.created_at || 0).getTime();
         return timeB - timeA;
       });
+
       setDatasets(sorted);
     } catch (err: any) {
       setHitlError(err.message || "Failed to load datasets");
@@ -167,7 +204,6 @@ export default function PipelineAndHITLPage() {
       prev.map((j) => (j.id === job.id ? { ...j, status: "running" } : j))
     );
 
-    // Normalization & Cryptographic Integrity animation
     updateJobStep(job.id, "norm", "running");
     await new Promise((r) => setTimeout(r, 350));
     updateJobStep(job.id, "norm", "completed");
@@ -210,7 +246,6 @@ export default function PipelineAndHITLPage() {
 
       updateJobStep(job.id, "crypto", "completed");
 
-      // Animate remaining intelligence steps
       const remaining = ["semantic", "behavioral", "inconsistency", "pii", "correlation", "risk", "policy"];
       for (const stepId of remaining) {
         updateJobStep(job.id, stepId, "running");
@@ -235,7 +270,6 @@ export default function PipelineAndHITLPage() {
         )
       );
 
-      // Refresh HITL section below so the new dataset is visible at the top (LIFO)
       await loadDatasets();
     } catch (err: any) {
       updateJobStep(job.id, "crypto", "failed");
@@ -266,11 +300,9 @@ export default function PipelineAndHITLPage() {
     setExpandedDatasets((prev) => ({ ...prev, [key]: nextState }));
 
     if (nextState) {
-      // Set default filters if not initialized
       if (!agentFilters[key]) {
         setAgentFilters((prev) => ({ ...prev, [key]: [...ALL_AGENTS] }));
       }
-      // Load content and findings if not cached
       const cacheKey = `${ds.dataset_id}_v${ds.version}`;
       if (!contentCache[cacheKey]) {
         await loadDatasetContent(ds.dataset_id, ds.version);
@@ -321,19 +353,28 @@ export default function PipelineAndHITLPage() {
     setAgentFilters((prev) => ({ ...prev, [dsId]: [] }));
   }
 
-  // Cell Finding Matcher: checks exact column and enabled agent filter
-  function getCellFinding(findings: any[], rec: any, col: string, activeAgents: string[]) {
-    if (!findings || findings.length === 0) return null;
+  // Returns ALL findings for this cell matching active agent filters
+  function getCellFindings(findings: any[], rec: any, col: string, activeAgents: string[]): any[] {
+    if (!findings || findings.length === 0) return [];
     const recId = String(rec.record_id);
 
-    return findings.find((f: any) => {
+    return findings.filter((f: any) => {
       if (String(f.record_id) !== recId) return false;
       const agentLower = (f.agent || "").toLowerCase();
       if (!activeAgents.includes(agentLower)) return false;
 
       const fCol = f.location?.field || f.field;
       if (fCol === col) return true;
-      if ((fCol === "text" || !fCol) && (col.toLowerCase().includes("text") || col.toLowerCase().includes("content") || col.toLowerCase().includes("instruction") || col.toLowerCase().includes("query") || col.toLowerCase().includes("prompt"))) {
+      if (
+        (fCol === "text" || !fCol) &&
+        (col.toLowerCase().includes("text") ||
+          col.toLowerCase().includes("content") ||
+          col.toLowerCase().includes("instruction") ||
+          col.toLowerCase().includes("query") ||
+          col.toLowerCase().includes("prompt") ||
+          col.toLowerCase().includes("response") ||
+          col.toLowerCase().includes("answer"))
+      ) {
         return true;
       }
       return false;
@@ -355,7 +396,7 @@ export default function PipelineAndHITLPage() {
     }
   }
 
-  // Decision actions for ANY dataset
+  // Decision actions for quarantined dataset
   async function submitDecision(datasetId: string, version: number, action: "APPROVE" | "REJECT") {
     setSubmittingAction((prev) => ({ ...prev, [datasetId]: true }));
     setActionNotice((prev) => ({ ...prev, [datasetId]: { type: "success", text: `Submitting ${action}...` } }));
@@ -457,7 +498,6 @@ export default function PipelineAndHITLPage() {
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || "Remediation rerun failed");
 
-      // Reset staging for this dataset
       setModifiedRecords((prev) => ({ ...prev, [dsId]: {} }));
       setRemovedRecords((prev) => ({ ...prev, [dsId]: [] }));
 
@@ -482,18 +522,27 @@ export default function PipelineAndHITLPage() {
     }
   }
 
+  // Filter datasets based on active status filter
+  const filteredDatasets = datasets.filter((ds) => {
+    const state = getDatasetHITLState(ds);
+    if (!state) return false;
+    if (hitlFilter === "ALL") return true;
+    return state === hitlFilter;
+  });
+
+  const quarantinedCount = datasets.filter((d) => getDatasetHITLState(d) === "QUARANTINED").length;
+  const rejectedCount = datasets.filter((d) => getDatasetHITLState(d) === "REJECTED").length;
+  const approvedCount = datasets.filter((d) => getDatasetHITLState(d) === "APPROVED").length;
+
   return (
     <div style={{ padding: "40px 48px", maxWidth: "1360px", margin: "0 auto" }}>
       {/* ============================================================ */}
       {/* PIPELINE SECTION                                             */}
       {/* ============================================================ */}
       <div style={{ marginBottom: "28px" }}>
-        <h1 style={{ fontSize: "24px", fontWeight: 700, color: "#111827", marginBottom: "6px" }}>
+        <h1 style={{ fontSize: "24px", fontWeight: 700, color: "#111827" }}>
           Pipeline
         </h1>
-        <p style={{ fontSize: "14px", color: "#6b7280" }}>
-          Pre-training cryptographic verification, multi-agent adversarial threat intelligence, and risk-adaptive governance.
-        </p>
       </div>
 
       {/* Upload Dropzone */}
@@ -505,12 +554,9 @@ export default function PipelineAndHITLPage() {
         textAlign: "center",
         marginBottom: "32px",
       }}>
-        <div style={{ fontSize: "15px", fontWeight: 600, color: "#111827", marginBottom: "8px" }}>
+        <div style={{ fontSize: "15px", fontWeight: 600, color: "#111827", marginBottom: "16px" }}>
           Select or drop dataset files to run pipeline
         </div>
-        <p style={{ fontSize: "13px", color: "#6b7280", marginBottom: "16px" }}>
-          Supports CSV, JSON, TXT, and XLSX datasets
-        </p>
 
         <div>
           <input
@@ -662,7 +708,6 @@ export default function PipelineAndHITLPage() {
                         </span>
                       </div>
 
-                      {/* Progress Track */}
                       <div style={{
                         height: "7px",
                         width: "100%",
@@ -705,10 +750,31 @@ export default function PipelineAndHITLPage() {
                   color: "#4b5563",
                 }}>
                   <div>
-                    Risk Score: <strong style={{ color: (job.riskScore ?? 0) >= 65 ? "#dc2626" : (job.riskScore ?? 0) >= 20 ? "#ea580c" : "#16a34a" }}>{job.riskScore ?? 0}/100</strong> ({job.riskLevel}) &bull; Findings: <strong>{job.findingsCount ?? 0}</strong>
+                    Risk Score:{" "}
+                    <strong style={{
+                      color:
+                        (job.riskScore ?? 0) >= 65
+                          ? "#dc2626"
+                          : (job.riskScore ?? 0) >= 20
+                          ? "#ea580c"
+                          : "#16a34a",
+                    }}>
+                      {formatRiskScore(job.status, job.riskScore ?? null)}
+                    </strong>{" "}
+                    ({job.riskLevel}) &bull; Findings: <strong>{job.findingsCount ?? 0}</strong>
                   </div>
                   <div>
-                    OPA Policy: <strong style={{ color: job.decision === "APPROVE" ? "#059669" : job.decision === "REJECT" ? "#dc2626" : "#ea580c" }}>{job.decision}</strong>
+                    OPA Policy:{" "}
+                    <strong style={{
+                      color:
+                        job.decision === "APPROVE"
+                          ? "#059669"
+                          : job.decision === "REJECT"
+                          ? "#dc2626"
+                          : "#ea580c",
+                    }}>
+                      {job.decision}
+                    </strong>
                   </div>
                 </div>
               )}
@@ -725,14 +791,11 @@ export default function PipelineAndHITLPage() {
         paddingTop: "36px",
         borderTop: "2px solid #e5e7eb",
       }}>
-        <div style={{ marginBottom: "24px", display: "flex", justifyContent: "space-between", alignItems: "flex-end" }}>
+        <div style={{ marginBottom: "20px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
           <div>
-            <h2 style={{ fontSize: "22px", fontWeight: 700, color: "#111827", marginBottom: "4px" }}>
+            <h2 style={{ fontSize: "22px", fontWeight: 700, color: "#111827" }}>
               Human in the Loop Review
             </h2>
-            <p style={{ fontSize: "13px", color: "#6b7280" }}>
-              Review ingested datasets in Last-In First-Out order. Filter detections by agent, accept or reject datasets, sanitize poisoned records, and re-evaluate.
-            </p>
           </div>
 
           <button
@@ -748,8 +811,39 @@ export default function PipelineAndHITLPage() {
               color: "#374151",
             }}
           >
-            {hitlLoading ? "Refreshing..." : "Refresh Datasets"}
+            {hitlLoading ? "Refreshing..." : "Refresh List"}
           </button>
+        </div>
+
+        {/* Status Filter Tabs (Quarantined, Rejected, Approved) */}
+        <div style={{ display: "flex", gap: "8px", marginBottom: "24px" }}>
+          {[
+            { id: "ALL", label: `All (${datasets.length})` },
+            { id: "QUARANTINED", label: `Quarantined (${quarantinedCount})` },
+            { id: "REJECTED", label: `Rejected (${rejectedCount})` },
+            { id: "APPROVED", label: `Approved (${approvedCount})` },
+          ].map((tab) => {
+            const isSelected = hitlFilter === tab.id;
+            return (
+              <button
+                key={tab.id}
+                onClick={() => setHitlFilter(tab.id as HITLFilterType)}
+                style={{
+                  padding: "6px 14px",
+                  borderRadius: "6px",
+                  fontSize: "13px",
+                  fontWeight: isSelected ? 600 : 500,
+                  border: isSelected ? "1px solid #111827" : "1px solid #d1d5db",
+                  background: isSelected ? "#111827" : "#ffffff",
+                  color: isSelected ? "#ffffff" : "#4b5563",
+                  cursor: "pointer",
+                  transition: "all 0.15s ease",
+                }}
+              >
+                {tab.label}
+              </button>
+            );
+          })}
         </div>
 
         {hitlError && (
@@ -766,8 +860,8 @@ export default function PipelineAndHITLPage() {
           </div>
         )}
 
-        {/* Datasets Stack (One after another in LIFO order) */}
-        {datasets.length === 0 && !hitlLoading ? (
+        {/* Datasets Stack (Prioritized: Quarantined first, then Rejected, then Approved) */}
+        {filteredDatasets.length === 0 && !hitlLoading ? (
           <div style={{
             padding: "48px 24px",
             textAlign: "center",
@@ -776,16 +870,15 @@ export default function PipelineAndHITLPage() {
             background: "#ffffff",
           }}>
             <div style={{ fontSize: "14px", fontWeight: 600, color: "#374151", marginBottom: "4px" }}>
-              No datasets available in gateway ledger
-            </div>
-            <div style={{ fontSize: "12px", color: "#6b7280" }}>
-              Upload and execute a dataset through the pipeline above to begin security review.
+              No datasets matching current filter
             </div>
           </div>
         ) : (
           <div style={{ display: "flex", flexDirection: "column", gap: "24px" }}>
-            {datasets.map((ds) => {
+            {filteredDatasets.map((ds) => {
               const isExpanded = !!expandedDatasets[ds.dataset_id];
+              const dsState = getDatasetHITLState(ds);
+              const isQuarantined = dsState === "QUARANTINED";
               const activeAgents = agentFilters[ds.dataset_id] || [...ALL_AGENTS];
               const cacheKey = `${ds.dataset_id}_v${ds.version}`;
               const content = contentCache[cacheKey];
@@ -856,27 +949,71 @@ export default function PipelineAndHITLPage() {
                         <div style={{
                           padding: "6px 12px",
                           borderRadius: "6px",
-                          background: (ds.risk_score ?? 0) >= 65 ? "#fef2f2" : (ds.risk_score ?? 0) >= 20 ? "#fffbeb" : "#ecfdf5",
-                          border: `1px solid ${(ds.risk_score ?? 0) >= 65 ? "#fecaca" : (ds.risk_score ?? 0) >= 20 ? "#fde68a" : "#a7f3d0"}`,
+                          background:
+                            ds.status === "BLOCKED"
+                              ? "#f3f4f6"
+                              : (ds.risk_score ?? 0) >= 65
+                              ? "#fef2f2"
+                              : (ds.risk_score ?? 0) >= 20
+                              ? "#fffbeb"
+                              : "#ecfdf5",
+                          border: `1px solid ${
+                            ds.status === "BLOCKED"
+                              ? "#e5e7eb"
+                              : (ds.risk_score ?? 0) >= 65
+                              ? "#fecaca"
+                              : (ds.risk_score ?? 0) >= 20
+                              ? "#fde68a"
+                              : "#a7f3d0"
+                          }`,
                           fontSize: "12px",
                         }}>
                           <span style={{ color: "#6b7280", marginRight: "4px" }}>Risk Score:</span>
-                          <strong style={{ color: (ds.risk_score ?? 0) >= 65 ? "#dc2626" : (ds.risk_score ?? 0) >= 20 ? "#d97706" : "#059669" }}>
-                            {ds.risk_score ?? 0}/100
+                          <strong style={{
+                            color:
+                              ds.status === "BLOCKED"
+                                ? "#6b7280"
+                                : (ds.risk_score ?? 0) >= 65
+                                ? "#dc2626"
+                                : (ds.risk_score ?? 0) >= 20
+                                ? "#d97706"
+                                : "#059669",
+                          }}>
+                            {formatRiskScore(ds.status, ds.risk_score)}
                           </strong>
-                          <span style={{ color: "#6b7280", marginLeft: "4px" }}>({ds.risk_level || "LOW"})</span>
+                          {ds.status !== "BLOCKED" && (
+                            <span style={{ color: "#6b7280", marginLeft: "4px" }}>({ds.risk_level || "LOW"})</span>
+                          )}
                         </div>
 
                         <div style={{
                           padding: "6px 12px",
                           borderRadius: "6px",
-                          background: ds.opa_decision === "APPROVE" ? "#ecfdf5" : ds.opa_decision === "REJECT" ? "#fef2f2" : "#fffbeb",
-                          border: `1px solid ${ds.opa_decision === "APPROVE" ? "#a7f3d0" : ds.opa_decision === "REJECT" ? "#fecaca" : "#fde68a"}`,
+                          background:
+                            dsState === "APPROVED"
+                              ? "#ecfdf5"
+                              : dsState === "REJECTED"
+                              ? "#fef2f2"
+                              : "#fffbeb",
+                          border: `1px solid ${
+                            dsState === "APPROVED"
+                              ? "#a7f3d0"
+                              : dsState === "REJECTED"
+                              ? "#fecaca"
+                              : "#fde68a"
+                          }`,
                           fontSize: "12px",
                         }}>
                           <span style={{ color: "#6b7280", marginRight: "4px" }}>Policy:</span>
-                          <strong style={{ color: ds.opa_decision === "APPROVE" ? "#059669" : ds.opa_decision === "REJECT" ? "#dc2626" : "#d97706" }}>
-                            {ds.opa_decision || ds.status}
+                          <strong style={{
+                            color:
+                              dsState === "APPROVED"
+                                ? "#059669"
+                                : dsState === "REJECTED"
+                                ? "#dc2626"
+                                : "#d97706",
+                          }}>
+                            {dsState}
                           </strong>
                         </div>
 
@@ -886,39 +1023,59 @@ export default function PipelineAndHITLPage() {
                       </div>
                     </div>
 
-                    {/* Right Action buttons: Accept / Reject for ALL datasets */}
+                    {/* Action buttons: Approve / Reject / Refresh ONLY for Quarantined datasets */}
                     <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
-                      <button
-                        onClick={() => submitDecision(ds.dataset_id, ds.version, "APPROVE")}
-                        disabled={isBusy}
-                        style={{
-                          background: "#059669",
-                          color: "#ffffff",
-                          border: "none",
-                          padding: "7px 14px",
-                          borderRadius: "6px",
-                          fontSize: "13px",
-                          fontWeight: 500,
-                        }}
-                      >
-                        Approve
-                      </button>
+                      {isQuarantined && (
+                        <>
+                          <button
+                            onClick={() => submitDecision(ds.dataset_id, ds.version, "APPROVE")}
+                            disabled={isBusy}
+                            style={{
+                              background: "#059669",
+                              color: "#ffffff",
+                              border: "none",
+                              padding: "7px 14px",
+                              borderRadius: "6px",
+                              fontSize: "13px",
+                              fontWeight: 500,
+                            }}
+                          >
+                            Approve
+                          </button>
 
-                      <button
-                        onClick={() => submitDecision(ds.dataset_id, ds.version, "REJECT")}
-                        disabled={isBusy}
-                        style={{
-                          background: "#dc2626",
-                          color: "#ffffff",
-                          border: "none",
-                          padding: "7px 14px",
-                          borderRadius: "6px",
-                          fontSize: "13px",
-                          fontWeight: 500,
-                        }}
-                      >
-                        Reject
-                      </button>
+                          <button
+                            onClick={() => submitDecision(ds.dataset_id, ds.version, "REJECT")}
+                            disabled={isBusy}
+                            style={{
+                              background: "#dc2626",
+                              color: "#ffffff",
+                              border: "none",
+                              padding: "7px 14px",
+                              borderRadius: "6px",
+                              fontSize: "13px",
+                              fontWeight: 500,
+                            }}
+                          >
+                            Reject
+                          </button>
+
+                          <button
+                            onClick={() => loadDatasetContent(ds.dataset_id, ds.version)}
+                            disabled={isBusy || loadingContent[ds.dataset_id]}
+                            style={{
+                              background: "#ffffff",
+                              color: "#374151",
+                              border: "1px solid #d1d5db",
+                              padding: "7px 12px",
+                              borderRadius: "6px",
+                              fontSize: "13px",
+                              fontWeight: 500,
+                            }}
+                          >
+                            {loadingContent[ds.dataset_id] ? "..." : "Refresh"}
+                          </button>
+                        </>
+                      )}
 
                       <button
                         onClick={() => toggleExpandDataset(ds)}
@@ -1031,11 +1188,11 @@ export default function PipelineAndHITLPage() {
                           </div>
                         </div>
 
-                        {/* Staged Modifications & Rerun Button */}
+                        {/* Staged Modifications & Rerun Button (primarily for quarantined) */}
                         {(dsModCount > 0 || dsRemCount > 0) && (
                           <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
                             <span style={{ fontSize: "12px", color: "#b45309", fontWeight: 500 }}>
-                              Staged: {dsModCount} cell edit(s), {dsRemCount} removal(s)
+                              Staged: {dsModCount} edit(s), {dsRemCount} removal(s)
                             </span>
                             <button
                               onClick={() => submitRemediation(ds.dataset_id, ds.version)}
@@ -1109,27 +1266,57 @@ export default function PipelineAndHITLPage() {
                                           const originalVal = rec.data[col] !== undefined ? String(rec.data[col]) : "";
                                           const editedVal = modifiedRecords[ds.dataset_id]?.[rId]?.[col];
                                           const displayVal = editedVal !== undefined ? editedVal : originalVal;
-                                          const finding = getCellFinding(findings, rec, col, activeAgents);
-                                          const badge = finding ? getAgentBadgeColor(finding.agent) : null;
+                                          const cellFindings = getCellFindings(findings, rec, col, activeAgents);
+                                          const hasFlags = cellFindings.length > 0;
+                                          const primaryFinding = cellFindings[0];
+                                          const badge = primaryFinding ? getAgentBadgeColor(primaryFinding.agent) : null;
 
                                           return (
                                             <td
                                               key={col}
                                               onClick={() => {
-                                                if (finding) setSelectedFinding(finding);
+                                                if (hasFlags) setSelectedFindings(cellFindings);
                                               }}
                                               style={{
                                                 padding: "8px 12px",
                                                 maxWidth: "380px",
                                                 wordBreak: "break-word",
-                                                cursor: finding ? "pointer" : "default",
-                                                background: badge ? badge.bg : editedVal !== undefined ? "#f0fdf4" : "transparent",
-                                                color: badge ? badge.text : "#111827",
-                                                borderLeft: badge ? `3px solid ${badge.border}` : "none",
+                                                cursor: hasFlags ? "pointer" : "default",
+                                                background: hasFlags
+                                                  ? cellFindings.length > 1
+                                                    ? "#fff1f2"
+                                                    : badge?.bg
+                                                  : editedVal !== undefined
+                                                  ? "#f0fdf4"
+                                                  : "transparent",
+                                                color: hasFlags
+                                                  ? cellFindings.length > 1
+                                                    ? "#991b1b"
+                                                    : badge?.text
+                                                  : "#111827",
+                                                borderLeft: hasFlags
+                                                  ? `3px solid ${cellFindings.length > 1 ? "#ef4444" : badge?.border}`
+                                                  : "none",
                                               }}
                                             >
                                               <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "8px" }}>
-                                                <span>{displayVal}</span>
+                                                <span style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                                                  {displayVal}
+                                                  {cellFindings.length > 1 && (
+                                                    <span style={{
+                                                      fontSize: "10px",
+                                                      fontWeight: 700,
+                                                      padding: "1px 5px",
+                                                      borderRadius: "3px",
+                                                      background: "#fee2e2",
+                                                      color: "#991b1b",
+                                                      border: "1px solid #fecaca",
+                                                      whiteSpace: "nowrap",
+                                                    }}>
+                                                      {cellFindings.length} agents
+                                                    </span>
+                                                  )}
+                                                </span>
                                                 <button
                                                   onClick={(e) => {
                                                     e.stopPropagation();
@@ -1182,74 +1369,121 @@ export default function PipelineAndHITLPage() {
                           )}
                         </div>
 
-                        {/* Threat Details Drawer */}
-                        {selectedFinding && (
+                        {/* Threat Details Drawer - Scrollable for Multiple Flagged Agents */}
+                        {selectedFindings && selectedFindings.length > 0 && (
                           <div style={{
-                            width: "350px",
+                            width: "360px",
                             background: "#ffffff",
                             border: "1px solid #e5e7eb",
                             borderRadius: "8px",
                             padding: "18px",
                             position: "sticky",
                             top: "24px",
+                            boxShadow: "0 2px 4px rgba(0, 0, 0, 0.04)",
                           }}>
-                            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "14px" }}>
+                            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "14px", paddingBottom: "10px", borderBottom: "1px solid #f3f4f6" }}>
                               <div style={{ fontSize: "14px", fontWeight: 700, color: "#111827" }}>
-                                Threat Details
+                                Threat Details ({selectedFindings.length} {selectedFindings.length > 1 ? "Detections" : "Detection"})
                               </div>
                               <button
-                                onClick={() => setSelectedFinding(null)}
-                                style={{ background: "none", border: "none", fontSize: "14px", color: "#9ca3af" }}
+                                onClick={() => setSelectedFindings(null)}
+                                style={{ background: "none", border: "none", fontSize: "14px", color: "#9ca3af", cursor: "pointer" }}
                               >
                                 x
                               </button>
                             </div>
 
-                            <div style={{ display: "flex", flexDirection: "column", gap: "12px", fontSize: "13px" }}>
-                              <div>
-                                <span style={{ fontSize: "11px", color: "#6b7280", fontWeight: 600 }}>AGENT</span>
-                                <div style={{ textTransform: "uppercase", fontWeight: 700, color: getAgentBadgeColor(selectedFinding.agent).text }}>
-                                  {selectedFinding.agent} Threat Intelligence
-                                </div>
-                              </div>
+                            <div style={{
+                              maxHeight: "540px",
+                              overflowY: "auto",
+                              display: "flex",
+                              flexDirection: "column",
+                              gap: "16px",
+                              paddingRight: "4px",
+                            }}>
+                              {selectedFindings.map((finding: any, idx: number) => {
+                                const badge = getAgentBadgeColor(finding.agent);
 
-                              <div>
-                                <span style={{ fontSize: "11px", color: "#6b7280", fontWeight: 600 }}>CATEGORY & SEVERITY</span>
-                                <div style={{ fontWeight: 600, color: "#111827" }}>
-                                  {selectedFinding.category} ({selectedFinding.severity})
-                                </div>
-                              </div>
+                                return (
+                                  <div
+                                    key={`${finding.agent}-${finding.finding_id || idx}`}
+                                    style={{
+                                      padding: "12px",
+                                      borderRadius: "6px",
+                                      background: "#fafafa",
+                                      border: "1px solid #e5e7eb",
+                                      display: "flex",
+                                      flexDirection: "column",
+                                      gap: "10px",
+                                      fontSize: "13px",
+                                    }}
+                                  >
+                                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                                      <span style={{
+                                        fontSize: "11px",
+                                        fontWeight: 700,
+                                        textTransform: "uppercase",
+                                        color: badge.text,
+                                        background: badge.bg,
+                                        padding: "2px 6px",
+                                        borderRadius: "4px",
+                                        border: `1px solid ${badge.border}`,
+                                      }}>
+                                        {finding.agent} Intelligence
+                                      </span>
+                                      <span style={{
+                                        fontSize: "11px",
+                                        fontWeight: 600,
+                                        padding: "2px 6px",
+                                        borderRadius: "4px",
+                                        background: "#f3f4f6",
+                                        color: "#374151",
+                                      }}>
+                                        {finding.severity}
+                                      </span>
+                                    </div>
 
-                              <div>
-                                <span style={{ fontSize: "11px", color: "#6b7280", fontWeight: 600 }}>EVIDENCE EXCERPT</span>
-                                <div style={{
-                                  background: "#f9fafb",
-                                  padding: "8px",
-                                  borderRadius: "5px",
-                                  border: "1px solid #e5e7eb",
-                                  fontFamily: "monospace",
-                                  fontSize: "12px",
-                                  color: "#1f2937",
-                                  maxHeight: "120px",
-                                  overflowY: "auto",
-                                }}>
-                                  {selectedFinding.evidence}
-                                </div>
-                              </div>
+                                    <div>
+                                      <span style={{ fontSize: "11px", color: "#6b7280", fontWeight: 600 }}>CATEGORY</span>
+                                      <div style={{ fontWeight: 600, color: "#111827" }}>
+                                        {finding.category}
+                                      </div>
+                                    </div>
 
-                              <div>
-                                <span style={{ fontSize: "11px", color: "#6b7280", fontWeight: 600 }}>SECURITY JUSTIFICATION</span>
-                                <div style={{ color: "#4b5563" }}>
-                                  {selectedFinding.reason}
-                                </div>
-                              </div>
+                                    <div>
+                                      <span style={{ fontSize: "11px", color: "#6b7280", fontWeight: 600 }}>EVIDENCE EXCERPT</span>
+                                      <div style={{
+                                        background: "#ffffff",
+                                        padding: "8px",
+                                        borderRadius: "5px",
+                                        border: "1px solid #e5e7eb",
+                                        fontFamily: "monospace",
+                                        fontSize: "12px",
+                                        color: "#1f2937",
+                                        maxHeight: "100px",
+                                        overflowY: "auto",
+                                        wordBreak: "break-word",
+                                      }}>
+                                        {finding.evidence}
+                                      </div>
+                                    </div>
 
-                              <div>
-                                <span style={{ fontSize: "11px", color: "#6b7280", fontWeight: 600 }}>ANALYZER</span>
-                                <div style={{ color: "#4b5563", fontSize: "12px" }}>
-                                  {selectedFinding.model_or_provider || "Adversarial Threat Intelligence Engine"}
-                                </div>
-                              </div>
+                                    <div>
+                                      <span style={{ fontSize: "11px", color: "#6b7280", fontWeight: 600 }}>SECURITY JUSTIFICATION</span>
+                                      <div style={{ color: "#4b5563", fontSize: "12px" }}>
+                                        {finding.reason}
+                                      </div>
+                                    </div>
+
+                                    <div>
+                                      <span style={{ fontSize: "11px", color: "#6b7280", fontWeight: 600 }}>ANALYZER</span>
+                                      <div style={{ color: "#6b7280", fontSize: "12px" }}>
+                                        {finding.model_or_provider || "Adversarial Threat Intelligence Engine"}
+                                      </div>
+                                    </div>
+                                  </div>
+                                );
+                              })}
                             </div>
                           </div>
                         )}
